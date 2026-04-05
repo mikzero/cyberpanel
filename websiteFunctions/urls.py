@@ -51,6 +51,8 @@ urlpatterns = [
     path('AddWPsiteforRemoteBackup', views.AddWPsiteforRemoteBackup, name='AddWPsiteforRemoteBackup'),
     path('UpdateRemoteschedules', views.UpdateRemoteschedules, name='UpdateRemoteschedules'),
     path('ScanWordpressSite', views.ScanWordpressSite, name='ScanWordpressSite'),
+    path('fetchWPDetails', views.fetchWPDetails, name='fetchWPDetails'),
+    path('fetchWPBackups', views.fetchWPBackups, name='fetchWPBackups'),
 
     # AddPlugin
     path('ConfigurePlugins', views.ConfigurePlugins, name='ConfigurePlugins'),
@@ -178,6 +180,11 @@ urlpatterns = [
     path('ListDockerSites', views.ListDockerSites, name='ListDockerSites'),
     path('fetchDockersite', views.fetchDockersite, name='fetchDockersite'),
 
+    # Docker Container Actions
+    path('docker/startContainer', views.startContainer, name='startContainer'),
+    path('docker/stopContainer', views.stopContainer, name='stopContainer'),
+    path('docker/restartContainer', views.restartContainer, name='restartContainer'),
+
     # SSH Configs
     path('getSSHConfigs', views.getSSHConfigs, name='getSSHConfigs'),
     path('deleteSSHKey', views.deleteSSHKey, name='deleteSSHKey'),
@@ -190,8 +197,13 @@ urlpatterns = [
     path('statusFunc', views.statusFunc, name='statusFunc'),
     path('tuneSettings', views.tuneSettings, name='tuneSettings'),
     path('saveApacheConfigsToFile', views.saveApacheConfigsToFile, name='saveApacheConfigsToFile'),
+    path('getTerminalJWT', views.get_terminal_jwt, name='get_terminal_jwt'),
 
     # Catch all for domains
     path('<domain>/<childDomain>', views.launchChild, name='launchChild'),
     path('<domain>', views.domain, name='domain'),
+
+    path('get_website_resources/', views.get_website_resources, name='get_website_resources'),
+
+    
 ]

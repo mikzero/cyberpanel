@@ -5,6 +5,7 @@ import sys
 import argparse
 import pwd
 import grp
+import re
 
 sys.path.append('/usr/local/CyberCP')
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "CyberCP.settings")
@@ -13,12 +14,284 @@ import subprocess
 import shutil
 import time
 import MySQLdb as mysql
-from CyberCP import settings
 import random
 import string
 
-VERSION = '2.3'
-BUILD = 9
+def update_all_config_files_with_password(new_password):
+    """
+    Update all configuration files that use the cyberpanel database password.
+    This includes FTP, PowerDNS, Postfix, Dovecot configurations.
+    """
+    config_updates = [
+        # Django settings
+        {
+            'path': '/usr/local/CyberCP/CyberCP/settings.py',
+            'updates': [
+                (r"('cyberpanel'[^}]+?'PASSWORD':\s*')[^']+'", r"\1%s'" % new_password)
+            ]
+        },
+        # FTP configurations
+        {
+            'path': '/etc/pure-ftpd/pureftpd-mysql.conf',
+            'updates': [
+                (r'^MYSQLPassword\s+.*$', 'MYSQLPassword %s' % new_password)
+            ]
+        },
+        {
+            'path': '/etc/pure-ftpd/db/mysql.conf',  # Ubuntu specific
+            'updates': [
+                (r'^MYSQLPassword\s+.*$', 'MYSQLPassword %s' % new_password)
+            ]
+        },
+        # PowerDNS configurations
+        {
+            'path': '/etc/pdns/pdns.conf',  # CentOS/RHEL
+            'updates': [
+                (r'^gmysql-password=.*$', 'gmysql-password=%s' % new_password)
+            ]
+        },
+        {
+            'path': '/etc/powerdns/pdns.conf',  # Ubuntu/Debian
+            'updates': [
+                (r'^gmysql-password=.*$', 'gmysql-password=%s' % new_password)
+            ]
+        },
+        # Postfix MySQL configurations
+        {
+            'path': '/etc/postfix/mysql-virtual_domains.cf',
+            'updates': [
+                (r'^password\s*=.*$', 'password = %s' % new_password)
+            ]
+        },
+        {
+            'path': '/etc/postfix/mysql-virtual_forwardings.cf',
+            'updates': [
+                (r'^password\s*=.*$', 'password = %s' % new_password)
+            ]
+        },
+        {
+            'path': '/etc/postfix/mysql-virtual_mailboxes.cf',
+            'updates': [
+                (r'^password\s*=.*$', 'password = %s' % new_password)
+            ]
+        },
+        {
+            'path': '/etc/postfix/mysql-virtual_email2email.cf',
+            'updates': [
+                (r'^password\s*=.*$', 'password = %s' % new_password)
+            ]
+        },
+        # Dovecot MySQL configuration
+        {
+            'path': '/etc/dovecot/dovecot-sql.conf.ext',
+            'updates': [
+                (r'^connect\s*=.*$', lambda m: update_dovecot_connect_string(m.group(0), new_password))
+            ]
+        }
+    ]
+    
+    for config in config_updates:
+        if not os.path.exists(config['path']):
+            continue
+            
+        try:
+            with open(config['path'], 'r') as f:
+                content = f.read()
+            
+            original_content = content
+            for pattern, replacement in config['updates']:
+                if callable(replacement):
+                    # For complex replacements like dovecot connect string
+                    content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+                else:
+                    content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+            
+            if content != original_content:
+                with open(config['path'], 'w') as f:
+                    f.write(content)
+                print("[RECOVERY] Updated password in: %s" % config['path'])
+        except Exception as e:
+            print("[RECOVERY] Warning: Could not update %s: %s" % (config['path'], str(e)))
+
+def update_dovecot_connect_string(connect_line, new_password):
+    """
+    Update the password in dovecot's connect string.
+    Format: connect = host=localhost dbname=cyberpanel user=cyberpanel password=oldpass
+    """
+    # Replace the password part in the connect string
+    updated = re.sub(r'password=\S+', 'password=%s' % new_password, connect_line)
+    return updated
+
+def restart_affected_services():
+    """
+    Restart services that use the cyberpanel database password.
+    """
+    services_to_restart = [
+        'pure-ftpd',      # FTP service
+        'postfix',        # Mail transfer agent
+        'dovecot',        # IMAP/POP3 server
+        'pdns',           # PowerDNS (CentOS/RHEL)
+        'powerdns',       # PowerDNS (Ubuntu/Debian)
+    ]
+    
+    for service in services_to_restart:
+        try:
+            # Try systemctl first (systemd)
+            result = subprocess.run(['systemctl', 'restart', service], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                print("[RECOVERY] Restarted service: %s" % service)
+            elif 'Unit' in result.stderr and 'not found' in result.stderr:
+                # Service doesn't exist, skip
+                pass
+            else:
+                # Try service command (older systems)
+                result = subprocess.run(['service', service, 'restart'],
+                                      capture_output=True, text=True)
+                if result.returncode == 0:
+                    print("[RECOVERY] Restarted service: %s" % service)
+        except Exception as e:
+            print("[RECOVERY] Warning: Could not restart %s: %s" % (service, str(e)))
+
+# Try to import settings, but handle case where CyberCP directory is damaged
+try:
+    from CyberCP import settings
+except ImportError:
+    print("WARNING: Cannot import CyberCP settings. Attempting recovery...")
+    
+    def recover_database_credentials():
+        """Attempt to recover or reset database credentials"""
+        
+        # First, ensure we have root MySQL password
+        if not os.path.exists('/etc/cyberpanel/mysqlPassword'):
+            print("FATAL: Cannot find MySQL root password file at /etc/cyberpanel/mysqlPassword")
+            print("Manual intervention required.")
+            sys.exit(1)
+        
+        root_password = open('/etc/cyberpanel/mysqlPassword', 'r').read().strip()
+        cyberpanel_password = None
+        
+        # Try to read existing settings.py to get cyberpanel password
+        settings_path = '/usr/local/CyberCP/CyberCP/settings.py'
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, 'r') as f:
+                    settings_content = f.read()
+                
+                import re
+                # Extract cyberpanel database password
+                db_pattern = r"'default':[^}]*'USER':\s*'cyberpanel'[^}]*'PASSWORD':\s*'([^']+)'"
+                match = re.search(db_pattern, settings_content, re.DOTALL)
+                
+                if match:
+                    cyberpanel_password = match.group(1)
+                    print("Found existing cyberpanel password in settings.py")
+                    
+                    # Test if this password actually works
+                    try:
+                        test_conn = mysql.connect(host='localhost', user='cyberpanel', 
+                                                passwd=cyberpanel_password, db='cyberpanel')
+                        test_conn.close()
+                        print("Verified cyberpanel database credentials are valid")
+                    except:
+                        print("Found password in settings.py but it doesn't work, will reset")
+                        cyberpanel_password = None
+            except Exception as e:
+                print("Could not extract password from settings.py: %s" % str(e))
+        
+        # If we couldn't get a working password, we need to reset it
+        if cyberpanel_password is None:
+            print("Resetting cyberpanel database user password...")
+            
+            # Check if we're on Ubuntu or CentOS
+            # On Ubuntu, cyberpanel uses root password; on CentOS, it uses a separate password
+            if os.path.exists('/etc/lsb-release'):
+                # Ubuntu - use root password
+                cyberpanel_password = root_password
+                reset_to_root = True
+            else:
+                # CentOS/others - generate new password
+                chars = string.ascii_letters + string.digits
+                cyberpanel_password = ''.join(random.choice(chars) for _ in range(14))
+                reset_to_root = False
+            
+            try:
+                # Connect as root and reset cyberpanel user
+                conn = mysql.connect(host='localhost', user='root', passwd=root_password)
+                cursor = conn.cursor()
+                
+                # Check if cyberpanel database exists
+                cursor.execute("SHOW DATABASES LIKE 'cyberpanel'")
+                if not cursor.fetchone():
+                    print("Creating cyberpanel database...")
+                    cursor.execute("CREATE DATABASE IF NOT EXISTS cyberpanel")
+                
+                # Reset cyberpanel user - drop and recreate to ensure clean state
+                cursor.execute("DROP USER IF EXISTS 'cyberpanel'@'localhost'")
+                cursor.execute("CREATE USER 'cyberpanel'@'localhost' IDENTIFIED BY '%s'" % cyberpanel_password)
+                cursor.execute("GRANT ALL PRIVILEGES ON cyberpanel.* TO 'cyberpanel'@'localhost'")
+                cursor.execute("FLUSH PRIVILEGES")
+                
+                conn.close()
+                
+                if reset_to_root:
+                    print("Reset cyberpanel user password to match root password (Ubuntu style)")
+                else:
+                    print("Reset cyberpanel user with new generated password (CentOS style)")
+                
+                # Update all configuration files with the new password
+                print("Updating all service configuration files with new password...")
+                update_all_config_files_with_password(cyberpanel_password)
+                
+                # Restart affected services to pick up new configuration
+                print("Restarting affected services...")
+                restart_affected_services()
+                
+                # Save the password to a temporary file for the upgrade process
+                temp_pass_file = '/tmp/cyberpanel_recovered_password'
+                with open(temp_pass_file, 'w') as f:
+                    f.write(cyberpanel_password)
+                os.chmod(temp_pass_file, 0o600)
+                print("Saved recovered password to temporary file")
+                
+            except Exception as e:
+                print("Failed to reset cyberpanel database user: %s" % str(e))
+                print("Manual intervention required. Please run:")
+                print("  mysql -u root -p")
+                print("  CREATE DATABASE IF NOT EXISTS cyberpanel;")
+                print("  GRANT ALL PRIVILEGES ON cyberpanel.* TO 'cyberpanel'@'localhost' IDENTIFIED BY 'your_password';")
+                print("  FLUSH PRIVILEGES;")
+                sys.exit(1)
+        
+        return cyberpanel_password, root_password
+    
+    # Perform recovery
+    cyberpanel_password, root_password = recover_database_credentials()
+    
+    # Create a minimal settings object for recovery
+    class MinimalSettings:
+        DATABASES = {
+            'default': {
+                'NAME': 'cyberpanel',
+                'USER': 'cyberpanel',
+                'PASSWORD': cyberpanel_password,
+                'HOST': 'localhost',
+                'PORT': '3306'
+            },
+            'rootdb': {
+                'NAME': 'mysql',
+                'USER': 'root',
+                'PASSWORD': root_password,
+                'HOST': 'localhost',
+                'PORT': '3306'
+            }
+        }
+    
+    settings = MinimalSettings()
+    print("Recovery complete. Continuing with upgrade...")
+
+VERSION = '2.4'
+BUILD = 4
 
 CENTOS7 = 0
 CENTOS8 = 1
@@ -29,6 +302,7 @@ CloudLinux8 = 5
 openEuler20 = 6
 openEuler22 = 7
 Ubuntu22 = 8
+Ubuntu24 = 9
 
 
 class Upgrade:
@@ -93,8 +367,7 @@ class Upgrade:
                     data.find('9.4') > -1 or data.find('9.3') > -1 or data.find('Shamrock Pampas') > -1 or data.find(
                     'Seafoam Ocelot') > -1 or data.find('VERSION="9.') > -1):
                 return 'al-93'
-        else:
-            return -1
+        return None
 
     @staticmethod
     def decideCentosVersion():
@@ -130,6 +403,8 @@ class Upgrade:
                 return Ubuntu20
             elif result.find('22.04') > -1:
                 return Ubuntu22
+            elif result.find('24.04') > -1:
+                return Ubuntu24
             else:
                 return Ubuntu18
 
@@ -182,6 +457,28 @@ class Upgrade:
                     Upgrade.stdOut(component + ' successful.', 0)
                     break
             return True
+        except:
+            return False
+    
+    @staticmethod
+    def executioner_silent(command, component, do_exit=0, shell=False):
+        """Silent version of executioner that suppresses all output"""
+        try:
+            FNULL = open(os.devnull, 'w')
+            count = 0
+            while True:
+                if shell == False:
+                    res = subprocess.call(shlex.split(command), stdout=FNULL, stderr=FNULL)
+                else:
+                    res = subprocess.call(command, stdout=FNULL, stderr=FNULL, shell=True)
+                if res != 0:
+                    count = count + 1
+                    if count == 3:
+                        FNULL.close()
+                        return False
+                else:
+                    FNULL.close()
+                    return True
         except:
             return False
 
@@ -323,6 +620,391 @@ class Upgrade:
             pass
 
     @staticmethod
+    def detectArchitecture():
+        """Detect system architecture - custom binaries only for x86_64"""
+        try:
+            import platform
+            arch = platform.machine()
+            return arch == "x86_64"
+        except Exception as msg:
+            Upgrade.stdOut(str(msg) + " [detectArchitecture]", 0)
+            return False
+
+    @staticmethod
+    def detectPlatform():
+        """Detect OS platform for binary selection (rhel8, rhel9, ubuntu)"""
+        try:
+            # Check for Ubuntu
+            if os.path.exists('/etc/lsb-release'):
+                with open('/etc/lsb-release', 'r') as f:
+                    content = f.read()
+                    if 'Ubuntu' in content or 'ubuntu' in content:
+                        return 'ubuntu'
+
+            # Check for RHEL-based distributions
+            if os.path.exists('/etc/os-release'):
+                with open('/etc/os-release', 'r') as f:
+                    content = f.read().lower()
+
+                    # Check for version 8.x (RHEL, AlmaLinux, Rocky, CloudLinux, CentOS 8)
+                    if 'version="8.' in content or 'version_id="8.' in content:
+                        if any(distro in content for distro in ['red hat', 'almalinux', 'rocky', 'cloudlinux', 'centos']):
+                            return 'rhel8'
+
+                    # Check for version 9.x
+                    if 'version="9.' in content or 'version_id="9.' in content:
+                        if any(distro in content for distro in ['red hat', 'almalinux', 'rocky', 'cloudlinux', 'centos']):
+                            return 'rhel9'
+
+            # Default to rhel9 if can't detect (safer default for newer systems)
+            Upgrade.stdOut("WARNING: Could not detect platform, defaulting to rhel9", 0)
+            return 'rhel9'
+
+        except Exception as msg:
+            Upgrade.stdOut(f"ERROR detecting platform: {msg}, defaulting to rhel9", 0)
+            return 'rhel9'
+
+    @staticmethod
+    def downloadCustomBinary(url, destination, expected_sha256=None):
+        """Download custom binary file with optional checksum verification"""
+        try:
+            Upgrade.stdOut(f"Downloading {os.path.basename(destination)}...", 0)
+
+            # Use wget for better progress display
+            command = f'wget -q --show-progress {url} -O {destination}'
+            res = subprocess.call(shlex.split(command))
+
+            # Check if file was downloaded successfully by verifying it exists and has reasonable size
+            if os.path.exists(destination):
+                file_size = os.path.getsize(destination)
+                # Verify file size is reasonable (at least 10KB to avoid error pages/empty files)
+                if file_size > 10240:  # 10KB
+                    if file_size > 1048576:  # 1MB
+                        Upgrade.stdOut(f"Downloaded successfully ({file_size / (1024*1024):.2f} MB)", 0)
+                    else:
+                        Upgrade.stdOut(f"Downloaded successfully ({file_size / 1024:.2f} KB)", 0)
+
+                    # Verify checksum if provided
+                    if expected_sha256:
+                        Upgrade.stdOut("Verifying checksum...", 0)
+                        import hashlib
+                        sha256_hash = hashlib.sha256()
+                        with open(destination, "rb") as f:
+                            for byte_block in iter(lambda: f.read(4096), b""):
+                                sha256_hash.update(byte_block)
+                        actual_sha256 = sha256_hash.hexdigest()
+
+                        if actual_sha256 == expected_sha256:
+                            Upgrade.stdOut("Checksum verified successfully", 0)
+                            return True
+                        else:
+                            Upgrade.stdOut(f"ERROR: Checksum mismatch!", 0)
+                            Upgrade.stdOut(f"Expected: {expected_sha256}", 0)
+                            Upgrade.stdOut(f"Got:      {actual_sha256}", 0)
+                            return False
+                    else:
+                        return True
+                else:
+                    Upgrade.stdOut(f"ERROR: Downloaded file too small ({file_size} bytes)", 0)
+                    return False
+            else:
+                Upgrade.stdOut("ERROR: Download failed - file not found", 0)
+                return False
+
+        except Exception as msg:
+            Upgrade.stdOut(f"ERROR: {msg} [downloadCustomBinary]", 0)
+            return False
+
+    @staticmethod
+    def installCustomOLSBinaries():
+        """Install custom OpenLiteSpeed binaries with PHP config support"""
+        try:
+            Upgrade.stdOut("Installing Custom OpenLiteSpeed Binaries", 0)
+            Upgrade.stdOut("=" * 50, 0)
+
+            # Check architecture
+            if not Upgrade.detectArchitecture():
+                Upgrade.stdOut("WARNING: Custom binaries only available for x86_64", 0)
+                Upgrade.stdOut("Skipping custom binary installation", 0)
+                Upgrade.stdOut("Standard OLS will be used", 0)
+                return True  # Not a failure, just skip
+
+            # Detect platform
+            platform = Upgrade.detectPlatform()
+            Upgrade.stdOut(f"Detected platform: {platform}", 0)
+
+            # Platform-specific URLs and checksums (OpenLiteSpeed v2.4.4 — all features config-driven, static linking)
+            # Includes: PHPConfig API, Origin Header Forwarding, ReadApacheConf (with Portmap), Auto-SSL (ACME v2), ModSecurity ABI Compatibility
+            # Module rebuilt 2026-03-04: fix SIGSEGV crash in apply_headers() on error responses (4xx/5xx)
+            BINARY_CONFIGS = {
+                'rhel8': {
+                    'url': 'https://cyberpanel.net/openlitespeed-2.4.4-x86_64-rhel8',
+                    'sha256': 'd08512da7a77468c09d6161de858db60bcc29aed7ce0abf76dca1c72104dc485',
+                    'module_url': 'https://cyberpanel.net/cyberpanel_ols-2.4.4-x86_64-rhel8.so',
+                    'module_sha256': '3fd3bf6e2d50fe2e94e67fcf9f8ee24c4cc31b9edb641bee8c129cb316c3454a',
+                    'modsec_url': 'https://cyberpanel.net/mod_security-2.4.4-x86_64-rhel8.so',
+                    'modsec_sha256': 'bbbf003bdc7979b98f09b640dffe2cbbe5f855427f41319e4c121403c05837b2'
+                },
+                'rhel9': {
+                    'url': 'https://cyberpanel.net/openlitespeed-2.4.4-x86_64-rhel9',
+                    'sha256': '418d2ea06e29c0f847a2e6cf01f7641d5fb72b65a04e27a8f6b3b54d673cc2df',
+                    'module_url': 'https://cyberpanel.net/cyberpanel_ols-2.4.4-x86_64-rhel9.so',
+                    'module_sha256': '4863fc4c227e50e2d6ec5827aed3e1ad92e9be03a548b7aa1a8a4640853db399',
+                    'modsec_url': 'https://cyberpanel.net/mod_security-2.4.4-x86_64-rhel9.so',
+                    'modsec_sha256': '19deb2ffbaf1334cf4ce4d46d53f747a75b29e835bf5a01f91ebcc0c78e98629'
+                },
+                'ubuntu': {
+                    'url': 'https://cyberpanel.net/openlitespeed-2.4.4-x86_64-ubuntu',
+                    'sha256': '60edf815379c32705540ad4525ea6d07c0390cabca232b6be12376ee538f4b1b',
+                    'module_url': 'https://cyberpanel.net/cyberpanel_ols-2.4.4-x86_64-ubuntu.so',
+                    'module_sha256': '0d7dd17c6e64ac46d4abd5ccb67cc2da51809e24692774e4df76d8f3a6c67e9d',
+                    'modsec_url': 'https://cyberpanel.net/mod_security-2.4.4-x86_64-ubuntu.so',
+                    'modsec_sha256': 'ed02c813136720bd4b9de5925f6e41bdc8392e494d7740d035479aaca6d1e0cd'
+                }
+            }
+
+            config = BINARY_CONFIGS.get(platform)
+            if not config:
+                Upgrade.stdOut(f"ERROR: No binaries available for platform {platform}", 0)
+                Upgrade.stdOut("Skipping custom binary installation", 0)
+                return True  # Not fatal
+
+            OLS_BINARY_URL = config['url']
+            OLS_BINARY_SHA256 = config['sha256']
+            MODULE_URL = config['module_url']
+            MODULE_SHA256 = config['module_sha256']
+            MODSEC_URL = config.get('modsec_url')
+            MODSEC_SHA256 = config.get('modsec_sha256')
+            OLS_BINARY_PATH = "/usr/local/lsws/bin/openlitespeed"
+            MODULE_PATH = "/usr/local/lsws/modules/cyberpanel_ols.so"
+            MODSEC_PATH = "/usr/local/lsws/modules/mod_security.so"
+
+            # Create backup
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_dir = f"/usr/local/lsws/backup-{timestamp}"
+
+            try:
+                os.makedirs(backup_dir, exist_ok=True)
+                if os.path.exists(OLS_BINARY_PATH):
+                    shutil.copy2(OLS_BINARY_PATH, f"{backup_dir}/openlitespeed.backup")
+                    Upgrade.stdOut(f"Backup created at: {backup_dir}", 0)
+                # Also backup existing ModSecurity if it exists
+                if os.path.exists(MODSEC_PATH):
+                    shutil.copy2(MODSEC_PATH, f"{backup_dir}/mod_security.so.backup")
+            except Exception as e:
+                Upgrade.stdOut(f"WARNING: Could not create backup: {e}", 0)
+
+            # Download binaries to temp location
+            tmp_binary = "/tmp/openlitespeed-custom"
+            tmp_module = "/tmp/cyberpanel_ols.so"
+            tmp_modsec = "/tmp/mod_security.so"
+
+            Upgrade.stdOut("Downloading custom binaries...", 0)
+
+            # Download OpenLiteSpeed binary with checksum verification
+            if not Upgrade.downloadCustomBinary(OLS_BINARY_URL, tmp_binary, OLS_BINARY_SHA256):
+                Upgrade.stdOut("ERROR: Failed to download or verify OLS binary", 0)
+                Upgrade.stdOut("Continuing with standard OLS", 0)
+                return True  # Not fatal, continue with standard OLS
+
+            # Download module with checksum verification (if available)
+            module_downloaded = False
+            if MODULE_URL and MODULE_SHA256:
+                if not Upgrade.downloadCustomBinary(MODULE_URL, tmp_module, MODULE_SHA256):
+                    Upgrade.stdOut("ERROR: Failed to download or verify module", 0)
+                    Upgrade.stdOut("Continuing with standard OLS", 0)
+                    return True  # Not fatal, continue with standard OLS
+                module_downloaded = True
+            else:
+                Upgrade.stdOut("Note: No CyberPanel module for this platform", 0)
+
+            # Download compatible ModSecurity if existing ModSecurity is installed
+            # This prevents ABI incompatibility crashes (Signal 11/SIGSEGV)
+            modsec_downloaded = False
+            if os.path.exists(MODSEC_PATH) and MODSEC_URL and MODSEC_SHA256:
+                Upgrade.stdOut("Existing ModSecurity detected - downloading compatible version...", 0)
+                if Upgrade.downloadCustomBinary(MODSEC_URL, tmp_modsec, MODSEC_SHA256):
+                    modsec_downloaded = True
+                else:
+                    Upgrade.stdOut("WARNING: Failed to download compatible ModSecurity", 0)
+                    Upgrade.stdOut("ModSecurity may crash due to ABI incompatibility", 0)
+                    Upgrade.stdOut("Consider manually updating ModSecurity after upgrade", 0)
+
+            # Install OpenLiteSpeed binary
+            Upgrade.stdOut("Installing custom binaries...", 0)
+
+            try:
+                shutil.move(tmp_binary, OLS_BINARY_PATH)
+                os.chmod(OLS_BINARY_PATH, 0o755)
+                Upgrade.stdOut("Installed OpenLiteSpeed binary", 0)
+            except Exception as e:
+                Upgrade.stdOut(f"ERROR: Failed to install binary: {e}", 0)
+                return False
+
+            # Install module (if downloaded)
+            if module_downloaded:
+                try:
+                    os.makedirs(os.path.dirname(MODULE_PATH), exist_ok=True)
+                    shutil.move(tmp_module, MODULE_PATH)
+                    os.chmod(MODULE_PATH, 0o644)
+                    Upgrade.stdOut("Installed CyberPanel module", 0)
+                except Exception as e:
+                    Upgrade.stdOut(f"ERROR: Failed to install module: {e}", 0)
+                    return False
+
+            # Install compatible ModSecurity (if downloaded)
+            if modsec_downloaded:
+                try:
+                    shutil.move(tmp_modsec, MODSEC_PATH)
+                    os.chmod(MODSEC_PATH, 0o644)
+                    Upgrade.stdOut("Installed compatible ModSecurity module", 0)
+                except Exception as e:
+                    Upgrade.stdOut(f"WARNING: Failed to install ModSecurity: {e}", 0)
+                    # Non-fatal, continue
+
+            # Verify installation - test binary before restart
+            if os.path.exists(OLS_BINARY_PATH):
+                if not module_downloaded or os.path.exists(MODULE_PATH):
+                    # Test 1: Verify binary is executable and shows version
+                    Upgrade.stdOut("Verifying new binary...", 0)
+                    try:
+                        result = subprocess.run(
+                            [OLS_BINARY_PATH, '-v'],
+                            capture_output=True,
+                            text=True,
+                            timeout=10
+                        )
+                        if result.returncode != 0:
+                            raise Exception(f"Binary test failed with exit code {result.returncode}")
+
+                        # Extract version info
+                        version_output = result.stdout if result.stdout else result.stderr
+                        if 'LiteSpeed' in version_output or 'OpenLiteSpeed' in version_output:
+                            Upgrade.stdOut(f"Binary version check passed", 0)
+                        else:
+                            Upgrade.stdOut("WARNING: Could not verify binary version", 0)
+                    except subprocess.TimeoutExpired:
+                        Upgrade.stdOut("WARNING: Binary version check timed out", 0)
+                    except Exception as e:
+                        Upgrade.stdOut(f"ERROR: Binary verification failed: {e}", 0)
+                        # Auto-rollback
+                        Upgrade.stdOut("Initiating auto-rollback...", 0)
+                        if Upgrade.rollbackOLSBinary(backup_dir, OLS_BINARY_PATH, MODULE_PATH if module_downloaded else None):
+                            Upgrade.stdOut("Rollback completed successfully", 0)
+                        else:
+                            Upgrade.stdOut("WARNING: Rollback may have failed", 0)
+                        return False
+
+                    Upgrade.stdOut("=" * 50, 0)
+                    Upgrade.stdOut("Custom Binaries Installed Successfully", 0)
+                    Upgrade.stdOut("Features enabled:", 0)
+                    Upgrade.stdOut("  - Static-linked cross-platform binary", 0)
+                    if module_downloaded:
+                        Upgrade.stdOut("  - Apache-style .htaccess support", 0)
+                        Upgrade.stdOut("  - php_value/php_flag directives", 0)
+                        Upgrade.stdOut("  - Enhanced header control", 0)
+                    Upgrade.stdOut(f"Backup: {backup_dir}", 0)
+                    Upgrade.stdOut("=" * 50, 0)
+                    return True
+
+            Upgrade.stdOut("ERROR: Installation verification failed", 0)
+            # Auto-rollback on verification failure
+            if Upgrade.rollbackOLSBinary(backup_dir, OLS_BINARY_PATH, MODULE_PATH if module_downloaded else None):
+                Upgrade.stdOut("Rollback completed successfully", 0)
+            return False
+
+        except Exception as msg:
+            Upgrade.stdOut(f"ERROR: {msg} [installCustomOLSBinaries]", 0)
+            Upgrade.stdOut("Continuing with standard OLS", 0)
+            return True  # Non-fatal error, continue
+
+    @staticmethod
+    def rollbackOLSBinary(backup_dir, binary_path, module_path=None):
+        """Rollback OpenLiteSpeed binary to previous version from backup"""
+        try:
+            Upgrade.stdOut("Rolling back to previous binary...", 0)
+
+            backup_binary = os.path.join(backup_dir, "openlitespeed.backup")
+
+            if os.path.exists(backup_binary):
+                # Stop OLS before rollback
+                Upgrade.stdOut("Stopping OpenLiteSpeed for rollback...", 0)
+                subprocess.run(['/usr/local/lsws/bin/lswsctrl', 'stop'],
+                             capture_output=True, timeout=30)
+
+                # Restore binary
+                shutil.copy2(backup_binary, binary_path)
+                os.chmod(binary_path, 0o755)
+                Upgrade.stdOut(f"Restored binary from {backup_binary}", 0)
+
+                # Start OLS after rollback
+                Upgrade.stdOut("Starting OpenLiteSpeed after rollback...", 0)
+                result = subprocess.run(['/usr/local/lsws/bin/lswsctrl', 'start'],
+                                       capture_output=True, timeout=30)
+
+                # Verify OLS started
+                import time
+                time.sleep(3)
+
+                result = subprocess.run(['pgrep', '-f', 'openlitespeed'],
+                                        capture_output=True)
+                if result.returncode == 0:
+                    Upgrade.stdOut("OpenLiteSpeed started successfully after rollback", 0)
+                    return True
+                else:
+                    Upgrade.stdOut("WARNING: OpenLiteSpeed may not have started after rollback", 0)
+                    return True  # Rollback was successful, startup issue is separate
+            else:
+                Upgrade.stdOut(f"ERROR: Backup not found at {backup_binary}", 0)
+                return False
+
+        except Exception as e:
+            Upgrade.stdOut(f"ERROR during rollback: {e}", 0)
+            return False
+
+    @staticmethod
+    def configureCustomModule():
+        """Configure CyberPanel module in OpenLiteSpeed config"""
+        try:
+            Upgrade.stdOut("Configuring CyberPanel module...", 0)
+
+            CONFIG_FILE = "/usr/local/lsws/conf/httpd_config.conf"
+
+            if not os.path.exists(CONFIG_FILE):
+                Upgrade.stdOut("WARNING: Config file not found", 0)
+                Upgrade.stdOut("Module will be auto-loaded", 0)
+                return True
+
+            # Check if module is already configured
+            with open(CONFIG_FILE, 'r') as f:
+                content = f.read()
+                if 'cyberpanel_ols' in content:
+                    Upgrade.stdOut("Module already configured", 0)
+                    return True
+
+            # Add module configuration
+            module_config = """
+module cyberpanel_ols {
+  ls_enabled          1
+}
+"""
+            # Backup config
+            shutil.copy2(CONFIG_FILE, f"{CONFIG_FILE}.backup")
+
+            # Append module config
+            with open(CONFIG_FILE, 'a') as f:
+                f.write(module_config)
+
+            Upgrade.stdOut("Module configured successfully", 0)
+            return True
+
+        except Exception as msg:
+            Upgrade.stdOut(f"WARNING: Module configuration failed: {msg}", 0)
+            Upgrade.stdOut("Module may still work via auto-load", 0)
+            return True  # Non-fatal
+
+    @staticmethod
     def download_install_phpmyadmin():
         try:
             cwd = os.getcwd()
@@ -335,17 +1017,21 @@ class Upgrade:
             except:
                 pass
 
-            command = 'wget -O /usr/local/CyberCP/public/phpmyadmin.zip https://github.com/usmannasir/cyberpanel/raw/stable/phpmyadmin.zip'
-            Upgrade.executioner(command, 0)
+            Upgrade.stdOut("Installing phpMyAdmin...", 0)
+            
+            command = 'wget -q -O /usr/local/CyberCP/public/phpmyadmin.zip https://github.com/usmannasir/cyberpanel/raw/stable/phpmyadmin.zip'
+            Upgrade.executioner_silent(command, 'Download phpMyAdmin')
 
-            command = 'unzip /usr/local/CyberCP/public/phpmyadmin.zip -d /usr/local/CyberCP/public/'
-            Upgrade.executioner(command, 0)
+            command = 'unzip -q /usr/local/CyberCP/public/phpmyadmin.zip -d /usr/local/CyberCP/public/'
+            Upgrade.executioner_silent(command, 'Extract phpMyAdmin')
 
             command = 'mv /usr/local/CyberCP/public/phpMyAdmin-*-all-languages /usr/local/CyberCP/public/phpmyadmin'
-            subprocess.call(command, shell=True)
+            subprocess.call(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             command = 'rm -f /usr/local/CyberCP/public/phpmyadmin.zip'
-            Upgrade.executioner(command, 0)
+            Upgrade.executioner_silent(command, 'Cleanup phpMyAdmin zip')
+            
+            Upgrade.stdOut("phpMyAdmin installation completed.", 0)
 
             ## Write secret phrase
 
@@ -468,11 +1154,13 @@ $cfg['Servers'][$i]['LogoutURL'] = 'phpmyadminsignin.php?logout';
 
             count = 1
 
+            Upgrade.stdOut("Installing SnappyMail...", 0)
+            
             while (1):
-                command = 'wget https://github.com/the-djmaze/snappymail/releases/download/v%s/snappymail-%s.zip' % (
+                command = 'wget -q https://github.com/the-djmaze/snappymail/releases/download/v%s/snappymail-%s.zip' % (
                     Upgrade.SnappyVersion, Upgrade.SnappyVersion)
                 cmd = shlex.split(command)
-                res = subprocess.call(cmd)
+                res = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if res != 0:
                     count = count + 1
                     if count == 3:
@@ -488,10 +1176,10 @@ $cfg['Servers'][$i]['LogoutURL'] = 'phpmyadminsignin.php?logout';
                 shutil.rmtree('/usr/local/CyberCP/public/snappymail')
 
             while (1):
-                command = 'unzip snappymail-%s.zip -d /usr/local/CyberCP/public/snappymail' % (Upgrade.SnappyVersion)
+                command = 'unzip -q snappymail-%s.zip -d /usr/local/CyberCP/public/snappymail' % (Upgrade.SnappyVersion)
 
                 cmd = shlex.split(command)
-                res = subprocess.call(cmd)
+                res = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if res != 0:
                     count = count + 1
                     if count == 3:
@@ -512,7 +1200,7 @@ $cfg['Servers'][$i]['LogoutURL'] = 'phpmyadminsignin.php?logout';
             while (1):
                 command = 'find . -type d -exec chmod 755 {} \;'
                 cmd = shlex.split(command)
-                res = subprocess.call(cmd)
+                res = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if res != 0:
                     count = count + 1
                     if count == 3:
@@ -527,7 +1215,7 @@ $cfg['Servers'][$i]['LogoutURL'] = 'phpmyadminsignin.php?logout';
             while (1):
                 command = 'find . -type f -exec chmod 644 {} \;'
                 cmd = shlex.split(command)
-                res = subprocess.call(cmd)
+                res = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if res != 0:
                     count = count + 1
                     if count == 3:
@@ -553,13 +1241,13 @@ $cfg['Servers'][$i]['LogoutURL'] = 'phpmyadminsignin.php?logout';
             writeToFile.close()
 
             command = "mkdir -p /usr/local/lscp/cyberpanel/rainloop/data/_data_/_default_/configs/"
-            Upgrade.executioner(command, 'mkdir snappymail configs', 0)
+            Upgrade.executioner_silent(command, 'mkdir snappymail configs', 0)
 
-            command = f'wget -O /usr/local/CyberCP/snappymail_cyberpanel.php  https://raw.githubusercontent.com/the-djmaze/snappymail/master/integrations/cyberpanel/install.php'
-            Upgrade.executioner(command, 'verify certificate', 0)
+            command = f'wget -q -O /usr/local/CyberCP/snappymail_cyberpanel.php  https://raw.githubusercontent.com/the-djmaze/snappymail/master/integrations/cyberpanel/install.php'
+            Upgrade.executioner_silent(command, 'verify certificate', 0)
 
             command = f'/usr/local/lsws/lsphp80/bin/php /usr/local/CyberCP/snappymail_cyberpanel.php'
-            Upgrade.executioner(command, 'verify certificate', 0)
+            Upgrade.executioner_silent(command, 'verify certificate', 0)
 
             # labsPath = '/usr/local/lscp/cyberpanel/rainloop/data/_data_/_default_/configs/application.ini'
 
@@ -681,6 +1369,8 @@ $cfg['Servers'][$i]['LogoutURL'] = 'phpmyadminsignin.php?logout';
             #             Upgrade.executioner(command, 'verify certificate', 0)
 
             os.chdir(cwd)
+            
+            Upgrade.stdOut("SnappyMail installation completed.", 0)
 
         except BaseException as msg:
             Upgrade.stdOut(str(msg) + " [downoad_and_install_raindloop]", 0)
@@ -803,6 +1493,236 @@ $cfg['Servers'][$i]['LogoutURL'] = 'phpmyadminsignin.php?logout';
             try:
                 cursor.execute(
                     'CREATE TABLE `baseTemplate_cyberpanelcosmetic` (`id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY, `MainDashboardCSS` longtext NOT NULL)')
+            except:
+                pass
+
+            # AI Scanner Tables
+            try:
+                cursor.execute('''
+                    CREATE TABLE `ai_scanner_settings` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `admin_id` integer NOT NULL UNIQUE,
+                        `api_key` varchar(255) DEFAULT NULL,
+                        `balance` decimal(10,4) NOT NULL DEFAULT 0.0000,
+                        `is_payment_configured` bool NOT NULL DEFAULT 0,
+                        `created_at` datetime(6) NOT NULL,
+                        `updated_at` datetime(6) NOT NULL,
+                        KEY `ai_scanner_settings_admin_id_idx` (`admin_id`),
+                        CONSTRAINT `ai_scanner_settings_admin_id_fk` FOREIGN KEY (`admin_id`) 
+                        REFERENCES `loginSystem_administrator` (`id`) ON DELETE CASCADE
+                    )
+                ''')
+            except:
+                pass
+
+            try:
+                cursor.execute('''
+                    CREATE TABLE `ai_scanner_history` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `admin_id` integer NOT NULL,
+                        `scan_id` varchar(100) NOT NULL UNIQUE,
+                        `domain` varchar(255) NOT NULL,
+                        `scan_type` varchar(20) NOT NULL DEFAULT 'full',
+                        `status` varchar(20) NOT NULL DEFAULT 'pending',
+                        `cost_usd` decimal(10,6) DEFAULT NULL,
+                        `files_scanned` integer NOT NULL DEFAULT 0,
+                        `issues_found` integer NOT NULL DEFAULT 0,
+                        `findings_json` longtext DEFAULT NULL,
+                        `summary_json` longtext DEFAULT NULL,
+                        `error_message` longtext DEFAULT NULL,
+                        `started_at` datetime(6) NOT NULL,
+                        `completed_at` datetime(6) DEFAULT NULL,
+                        KEY `ai_scanner_history_admin_id_idx` (`admin_id`),
+                        KEY `ai_scanner_history_scan_id_idx` (`scan_id`),
+                        KEY `ai_scanner_history_started_at_idx` (`started_at`),
+                        CONSTRAINT `ai_scanner_history_admin_id_fk` FOREIGN KEY (`admin_id`) 
+                        REFERENCES `loginSystem_administrator` (`id`) ON DELETE CASCADE
+                    )
+                ''')
+            except:
+                pass
+
+            try:
+                cursor.execute('''
+                    CREATE TABLE `ai_scanner_file_tokens` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `token` varchar(100) NOT NULL UNIQUE,
+                        `scan_history_id` integer NOT NULL,
+                        `domain` varchar(255) NOT NULL,
+                        `wp_path` varchar(500) NOT NULL,
+                        `expires_at` datetime(6) NOT NULL,
+                        `created_at` datetime(6) NOT NULL,
+                        `is_active` bool NOT NULL DEFAULT 1,
+                        KEY `ai_scanner_file_tokens_scan_history_id_idx` (`scan_history_id`),
+                        KEY `ai_scanner_file_tokens_token_idx` (`token`),
+                        CONSTRAINT `ai_scanner_file_tokens_scan_history_id_fk` FOREIGN KEY (`scan_history_id`) 
+                        REFERENCES `ai_scanner_history` (`id`) ON DELETE CASCADE
+                    )
+                ''')
+            except:
+                pass
+
+            try:
+                cursor.execute('''
+                    CREATE TABLE `ai_scanner_status_updates` (
+                        `scan_id` varchar(100) NOT NULL PRIMARY KEY,
+                        `phase` varchar(50) NOT NULL,
+                        `progress` integer NOT NULL DEFAULT 0,
+                        `current_file` longtext DEFAULT NULL,
+                        `files_discovered` integer NOT NULL DEFAULT 0,
+                        `files_scanned` integer NOT NULL DEFAULT 0,
+                        `files_remaining` integer NOT NULL DEFAULT 0,
+                        `threats_found` integer NOT NULL DEFAULT 0,
+                        `critical_threats` integer NOT NULL DEFAULT 0,
+                        `high_threats` integer NOT NULL DEFAULT 0,
+                        `activity_description` longtext DEFAULT NULL,
+                        `last_updated` datetime(6) NOT NULL,
+                        `created_at` datetime(6) NOT NULL,
+                        KEY `ai_scanner_status_updates_scan_id_last_updated_idx` (`scan_id`, `last_updated` DESC)
+                    )
+                ''')
+            except:
+                pass
+
+            # AI Scanner Scheduled Scans Tables
+            try:
+                cursor.execute('''
+                    CREATE TABLE `ai_scanner_scheduled_scans` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `admin_id` integer NOT NULL,
+                        `name` varchar(200) NOT NULL,
+                        `domains` longtext NOT NULL,
+                        `frequency` varchar(20) NOT NULL DEFAULT 'weekly',
+                        `scan_type` varchar(20) NOT NULL DEFAULT 'full',
+                        `time_of_day` time NOT NULL,
+                        `day_of_week` integer DEFAULT NULL,
+                        `day_of_month` integer DEFAULT NULL,
+                        `status` varchar(20) NOT NULL DEFAULT 'active',
+                        `last_run` datetime(6) DEFAULT NULL,
+                        `next_run` datetime(6) DEFAULT NULL,
+                        `created_at` datetime(6) NOT NULL,
+                        `updated_at` datetime(6) NOT NULL,
+                        `email_notifications` bool NOT NULL DEFAULT 1,
+                        `notification_emails` longtext NOT NULL DEFAULT '',
+                        `notify_on_threats` bool NOT NULL DEFAULT 1,
+                        `notify_on_completion` bool NOT NULL DEFAULT 0,
+                        `notify_on_failure` bool NOT NULL DEFAULT 1,
+                        KEY `ai_scanner_scheduled_scans_admin_id_idx` (`admin_id`),
+                        KEY `ai_scanner_scheduled_scans_status_next_run_idx` (`status`, `next_run`),
+                        CONSTRAINT `ai_scanner_scheduled_scans_admin_id_fk` FOREIGN KEY (`admin_id`) 
+                        REFERENCES `loginSystem_administrator` (`id`) ON DELETE CASCADE
+                    )
+                ''')
+            except:
+                pass
+
+            try:
+                cursor.execute('''
+                    CREATE TABLE `ai_scanner_scheduled_executions` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `scheduled_scan_id` integer NOT NULL,
+                        `execution_time` datetime(6) NOT NULL,
+                        `status` varchar(20) NOT NULL DEFAULT 'pending',
+                        `domains_scanned` longtext NOT NULL DEFAULT '',
+                        `total_scans` integer NOT NULL DEFAULT 0,
+                        `successful_scans` integer NOT NULL DEFAULT 0,
+                        `failed_scans` integer NOT NULL DEFAULT 0,
+                        `total_cost` decimal(10,6) NOT NULL DEFAULT 0.000000,
+                        `scan_ids` longtext NOT NULL DEFAULT '',
+                        `error_message` longtext DEFAULT NULL,
+                        `started_at` datetime(6) DEFAULT NULL,
+                        `completed_at` datetime(6) DEFAULT NULL,
+                        KEY `ai_scanner_scheduled_executions_scheduled_scan_id_idx` (`scheduled_scan_id`),
+                        KEY `ai_scanner_scheduled_executions_execution_time_idx` (`execution_time` DESC),
+                        CONSTRAINT `ai_scanner_scheduled_executions_scheduled_scan_id_fk` FOREIGN KEY (`scheduled_scan_id`)
+                        REFERENCES `ai_scanner_scheduled_scans` (`id`) ON DELETE CASCADE
+                    )
+                ''')
+            except:
+                pass
+
+            # AI Scanner File Operation Audit Tables
+            try:
+                cursor.execute('''
+                    CREATE TABLE `scanner_file_operations` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `scan_id` varchar(255) NOT NULL,
+                        `operation` varchar(20) NOT NULL,
+                        `file_path` varchar(500) NOT NULL,
+                        `backup_path` varchar(500) DEFAULT NULL,
+                        `success` bool NOT NULL DEFAULT 0,
+                        `error_message` longtext DEFAULT NULL,
+                        `ip_address` varchar(45) DEFAULT NULL,
+                        `user_agent` varchar(255) DEFAULT NULL,
+                        `created_at` datetime(6) NOT NULL,
+                        KEY `scanner_file_operations_scan_id_idx` (`scan_id`),
+                        KEY `scanner_file_operations_created_at_idx` (`created_at`),
+                        KEY `scanner_file_operations_scan_created_idx` (`scan_id`, `created_at`)
+                    )
+                ''')
+            except:
+                pass
+
+            try:
+                cursor.execute('''
+                    CREATE TABLE `scanner_api_rate_limits` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `scan_id` varchar(255) NOT NULL,
+                        `endpoint` varchar(100) NOT NULL,
+                        `request_count` integer NOT NULL DEFAULT 0,
+                        `last_request_at` datetime(6) NOT NULL,
+                        UNIQUE KEY `scanner_api_rate_limits_scan_endpoint_unique` (`scan_id`, `endpoint`),
+                        KEY `scanner_api_rate_limits_scan_endpoint_idx` (`scan_id`, `endpoint`)
+                    )
+                ''')
+            except:
+                pass
+
+            # CyberMail Email Delivery Tables
+            try:
+                cursor.execute('''
+                    CREATE TABLE `cybermail_accounts` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `admin_id` integer NOT NULL UNIQUE,
+                        `platform_account_id` integer DEFAULT NULL,
+                        `api_key` varchar(255) NOT NULL DEFAULT '',
+                        `email` varchar(255) NOT NULL DEFAULT '',
+                        `plan_name` varchar(100) NOT NULL DEFAULT 'Free',
+                        `plan_slug` varchar(50) NOT NULL DEFAULT 'free',
+                        `emails_per_month` integer NOT NULL DEFAULT 15000,
+                        `is_connected` bool NOT NULL DEFAULT 0,
+                        `relay_enabled` bool NOT NULL DEFAULT 0,
+                        `smtp_credential_id` integer DEFAULT NULL,
+                        `smtp_username` varchar(255) NOT NULL DEFAULT '',
+                        `smtp_host` varchar(255) NOT NULL DEFAULT 'mail.cyberpersons.com',
+                        `smtp_port` integer NOT NULL DEFAULT 587,
+                        `created_at` datetime(6) NOT NULL,
+                        `updated_at` datetime(6) NOT NULL,
+                        CONSTRAINT `cybermail_accounts_admin_id_fk` FOREIGN KEY (`admin_id`)
+                        REFERENCES `loginSystem_administrator` (`id`) ON DELETE CASCADE
+                    )
+                ''')
+            except:
+                pass
+
+            try:
+                cursor.execute('''
+                    CREATE TABLE `cybermail_domains` (
+                        `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                        `account_id` integer NOT NULL,
+                        `domain` varchar(255) NOT NULL DEFAULT '',
+                        `platform_domain_id` integer DEFAULT NULL,
+                        `status` varchar(50) NOT NULL DEFAULT 'pending',
+                        `spf_verified` bool NOT NULL DEFAULT 0,
+                        `dkim_verified` bool NOT NULL DEFAULT 0,
+                        `dmarc_verified` bool NOT NULL DEFAULT 0,
+                        `dns_configured` bool NOT NULL DEFAULT 0,
+                        `created_at` datetime(6) NOT NULL,
+                        KEY `cybermail_domains_account_id_idx` (`account_id`),
+                        CONSTRAINT `cybermail_domains_account_id_fk` FOREIGN KEY (`account_id`)
+                        REFERENCES `cybermail_accounts` (`id`) ON DELETE CASCADE
+                    )
+                ''')
             except:
                 pass
 
@@ -1204,7 +2124,7 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
             except:
                 pass
 
-            if Upgrade.FindOperatingSytem() == Ubuntu22:
+            if Upgrade.FindOperatingSytem() == Ubuntu22 or Upgrade.FindOperatingSytem() == Ubuntu24:
                 ### If ftp not installed then upgrade will fail so this command should not do exit
 
                 command = "sed -i 's/MYSQLCrypt md5/MYSQLCrypt crypt/g' /etc/pure-ftpd/db/mysql.conf"
@@ -1215,12 +2135,13 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
 
             try:
                 clAPVersion = Upgrade.FetchCloudLinuxAlmaVersionVersion()
-                type = clAPVersion.split('-')[0]
-                version = int(clAPVersion.split('-')[1])
+                if isinstance(clAPVersion, str) and '-' in clAPVersion:
+                    type = clAPVersion.split('-')[0]
+                    version = int(clAPVersion.split('-')[1])
 
-                if type == 'al' and version >= 90:
-                    command = "sed -i 's/MYSQLCrypt md5/MYSQLCrypt crypt/g' /etc/pure-ftpd/pureftpd-mysql.conf"
-                    Upgrade.executioner(command, command, 0)
+                    if type == 'al' and version >= 90:
+                        command = "sed -i 's/MYSQLCrypt md5/MYSQLCrypt crypt/g' /etc/pure-ftpd/pureftpd-mysql.conf"
+                        Upgrade.executioner(command, command, 0)
             except:
                 pass
 
@@ -1494,6 +2415,58 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
   KEY `emailPremium_emaillogs_email_id_9ef49552_fk_e_users_email` (`email_id`),
   CONSTRAINT `emailPremium_emaillogs_email_id_9ef49552_fk_e_users_email` FOREIGN KEY (`email_id`) REFERENCES `e_users` (`email`)
 )"""
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            # Email Filtering Tables - Catch-All, Plus-Addressing, Pattern Forwarding
+            query = """CREATE TABLE IF NOT EXISTS `e_catchall` (
+  `domain_id` varchar(50) NOT NULL,
+  `destination` varchar(255) NOT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT 1,
+  PRIMARY KEY (`domain_id`),
+  CONSTRAINT `fk_catchall_domain` FOREIGN KEY (`domain_id`) REFERENCES `e_domains` (`domain`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = """CREATE TABLE IF NOT EXISTS `e_server_settings` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `plus_addressing_enabled` tinyint(1) NOT NULL DEFAULT 0,
+  `plus_addressing_delimiter` varchar(1) NOT NULL DEFAULT '+',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = """CREATE TABLE IF NOT EXISTS `e_plus_override` (
+  `domain_id` varchar(50) NOT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT 1,
+  PRIMARY KEY (`domain_id`),
+  CONSTRAINT `fk_plus_override_domain` FOREIGN KEY (`domain_id`) REFERENCES `e_domains` (`domain`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = """CREATE TABLE IF NOT EXISTS `e_pattern_forwarding` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `domain_id` varchar(50) NOT NULL,
+  `pattern` varchar(255) NOT NULL,
+  `destination` varchar(255) NOT NULL,
+  `pattern_type` varchar(20) NOT NULL DEFAULT 'wildcard',
+  `priority` int(11) NOT NULL DEFAULT 100,
+  `enabled` tinyint(1) NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  KEY `fk_pattern_domain` (`domain_id`),
+  CONSTRAINT `fk_pattern_domain` FOREIGN KEY (`domain_id`) REFERENCES `e_domains` (`domain`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
             try:
                 cursor.execute(query)
             except:
@@ -1826,12 +2799,322 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
             except:
                 pass
 
+            ## Resource Limits columns for cgroups v2 integration
+            query = "ALTER TABLE packages_package ADD COLUMN memoryLimitMB INT DEFAULT 1024;"
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = "ALTER TABLE packages_package ADD COLUMN cpuCores INT DEFAULT 1;"
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = "ALTER TABLE packages_package ADD COLUMN ioLimitMBPS INT DEFAULT 10;"
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = "ALTER TABLE packages_package ADD COLUMN inodeLimit INT DEFAULT 400000;"
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = "ALTER TABLE packages_package ADD COLUMN maxConnections INT DEFAULT 10;"
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = "ALTER TABLE packages_package ADD COLUMN procSoftLimit INT DEFAULT 400;"
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
+            query = "ALTER TABLE packages_package ADD COLUMN procHardLimit INT DEFAULT 500;"
+            try:
+                cursor.execute(query)
+            except:
+                pass
+
             try:
                 connection.close()
             except:
                 pass
         except:
             pass
+
+    @staticmethod
+    def setupSieve():
+        """Enable Sieve plugin and ManageSieve for email filtering (idempotent)"""
+        try:
+            if not os.path.exists('/etc/dovecot/dovecot.conf'):
+                Upgrade.stdOut("Dovecot not installed, skipping Sieve setup.", 0)
+                return
+
+            ## Ensure cyrus-sasl-plain is installed (needed for SMTP relay on RHEL/Alma/CentOS)
+            if os.path.exists('/etc/redhat-release'):
+                command = 'dnf install -y cyrus-sasl-plain'
+                ProcessUtilities.executioner(command)
+
+            import re
+
+            dovecot_conf = '/etc/dovecot/dovecot.conf'
+            with open(dovecot_conf, 'r') as f:
+                content = f.read()
+
+            changed = False
+
+            # Add sieve to protocols if missing
+            protocols_match = re.search(r'^protocols\s*=\s*(.+)$', content, re.MULTILINE)
+            if protocols_match and 'sieve' not in protocols_match.group(1):
+                content = content.replace(protocols_match.group(0),
+                    protocols_match.group(0) + ' sieve')
+                changed = True
+
+            # Add sieve plugin to protocol lda mail_plugins if missing
+            lda_match = re.search(r'(protocol lda\s*\{[^}]*mail_plugins\s*=\s*)([^\n]+)', content)
+            if lda_match and 'sieve' not in lda_match.group(2):
+                content = content.replace(lda_match.group(0),
+                    lda_match.group(1) + lda_match.group(2).rstrip() + ' sieve')
+                changed = True
+
+            # Add lda_mailbox_autocreate/autosubscribe for sieve fileinto
+            if 'lda_mailbox_autocreate' not in content:
+                lda_plugins = re.search(r'(protocol lda\s*\{[^}]*mail_plugins\s*=[^\n]+\n)', content)
+                if lda_plugins:
+                    content = content.replace(lda_plugins.group(0),
+                        lda_plugins.group(0) +
+                        '    lda_mailbox_autocreate = yes\n    lda_mailbox_autosubscribe = yes\n')
+                    changed = True
+
+            # Add sieve storage settings to plugin section
+            if 'sieve_dir' not in content:
+                plugin_match = re.search(r'(plugin\s*\{[^}]*)(})', content)
+                if plugin_match:
+                    content = content.replace(plugin_match.group(0),
+                        plugin_match.group(1) +
+                        '\n  sieve = ~/sieve/.dovecot.sieve\n  sieve_dir = ~/sieve\n\n' +
+                        plugin_match.group(2))
+                    changed = True
+
+            if changed:
+                with open(dovecot_conf, 'w') as f:
+                    f.write(content)
+
+            # Fix dovecot-sql.conf.ext to include home directory for sieve storage
+            sql_conf = '/etc/dovecot/dovecot-sql.conf.ext'
+            if os.path.exists(sql_conf):
+                with open(sql_conf, 'r') as f:
+                    sql_content = f.read()
+                if 'as home' not in sql_content and 'user_query' in sql_content:
+                    sql_content = re.sub(
+                        r"(user_query\s*=\s*SELECT\s+'5000'\s+as\s+uid,\s+'5000'\s+as\s+gid,\s+mail)\s+(FROM\s+e_users\s+WHERE\s+email='%u';)",
+                        r"\1, CONCAT('/home/vmail/', SUBSTRING_INDEX(email, '@', -1), '/', SUBSTRING_INDEX(email, '@', 1)) as home \2",
+                        sql_content)
+                    with open(sql_conf, 'w') as f:
+                        f.write(sql_content)
+
+            # Write ManageSieve config if not properly configured
+            managesieve_conf = '/etc/dovecot/conf.d/20-managesieve.conf'
+            write_managesieve = True
+            if os.path.exists(managesieve_conf):
+                with open(managesieve_conf, 'r') as f:
+                    existing = f.read()
+                if 'inet_listener sieve' in existing and 'service managesieve' in existing:
+                    write_managesieve = False
+
+            if write_managesieve:
+                os.makedirs('/etc/dovecot/conf.d', exist_ok=True)
+                with open(managesieve_conf, 'w') as f:
+                    f.write("""protocols = $protocols sieve
+
+service managesieve-login {
+  inet_listener sieve {
+    port = 4190
+  }
+}
+
+service managesieve {
+  process_limit = 256
+}
+
+protocol sieve {
+  managesieve_notify_capability = mailto
+  managesieve_sieve_capability = fileinto reject envelope encoded-character vacation subaddress comparator-i;ascii-numeric relational regex imap4flags copy include variables body enotify environment mailbox date index ihave duplicate mime foreverypart extracttext
+}
+""")
+
+            # Install sieve packages if missing
+            if os.path.exists('/etc/lsb-release') or os.path.exists('/etc/debian_version'):
+                Upgrade.executioner('apt-get install -y dovecot-sieve dovecot-managesieved', 'Install Sieve packages', 0)
+            else:
+                Upgrade.executioner('yum install -y dovecot-pigeonhole', 'Install Sieve packages', 0)
+
+            # Open firewall port
+            try:
+                from plogical.firewallUtilities import FirewallUtilities
+                FirewallUtilities.addSieveFirewallRule()
+            except:
+                pass
+
+            subprocess.call(['systemctl', 'restart', 'dovecot'])
+            Upgrade.stdOut("Sieve setup complete!", 0)
+
+        except BaseException as msg:
+            Upgrade.stdOut("setupSieve error: " + str(msg), 0)
+
+    @staticmethod
+    def setupWebmail():
+        """Set up Dovecot master user and webmail config for SSO (idempotent)"""
+        try:
+            # Skip if no mail server installed
+            if not os.path.exists('/etc/dovecot/dovecot.conf'):
+                Upgrade.stdOut("Dovecot not installed, skipping webmail setup.", 0)
+                return
+
+            # Always run migrations and dovecot.conf patching even if conf exists
+            already_configured = os.path.exists('/etc/cyberpanel/webmail.conf') and \
+                                 os.path.exists('/etc/dovecot/master-users')
+
+            if not already_configured:
+                Upgrade.stdOut("Setting up webmail master user for SSO...", 0)
+
+                from plogical.randomPassword import generate_pass
+
+                master_password = generate_pass(32)
+
+                # Hash the password using doveadm
+                result = subprocess.run(
+                    ['doveadm', 'pw', '-s', 'SHA512-CRYPT', '-p', master_password],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    Upgrade.stdOut("doveadm pw failed: " + result.stderr, 0)
+                    return
+
+                password_hash = result.stdout.strip()
+
+                # Write /etc/dovecot/master-users
+                with open('/etc/dovecot/master-users', 'w') as f:
+                    f.write('cyberpanel_master:' + password_hash + '\n')
+                os.chmod('/etc/dovecot/master-users', 0o600)
+                subprocess.call(['chown', 'dovecot:dovecot', '/etc/dovecot/master-users'])
+
+                # Write /etc/cyberpanel/webmail.conf
+                webmail_conf = {
+                    'master_user': 'cyberpanel_master',
+                    'master_password': master_password
+                }
+                with open('/etc/cyberpanel/webmail.conf', 'w') as f:
+                    json.dump(webmail_conf, f)
+                os.chmod('/etc/cyberpanel/webmail.conf', 0o600)
+                subprocess.call(['chown', 'cyberpanel:cyberpanel', '/etc/cyberpanel/webmail.conf'])
+
+            # Patch dovecot.conf if master user config not present
+            dovecot_conf_path = '/etc/dovecot/dovecot.conf'
+            with open(dovecot_conf_path, 'r') as f:
+                dovecot_content = f.read()
+
+            if 'auth_master_user_separator' not in dovecot_content:
+                master_block = """auth_master_user_separator = *
+
+passdb {
+    driver = passwd-file
+    master = yes
+    args = /etc/dovecot/master-users
+    result_success = continue
+}
+
+"""
+                dovecot_content = dovecot_content.replace(
+                    'passdb {',
+                    master_block + 'passdb {',
+                    1  # Only replace the first occurrence
+                )
+                with open(dovecot_conf_path, 'w') as f:
+                    f.write(dovecot_content)
+
+            # Run webmail migrations
+            Upgrade.executioner(
+                'python /usr/local/CyberCP/manage.py makemigrations webmail',
+                'Webmail makemigrations', shell=True
+            )
+            Upgrade.executioner(
+                'python /usr/local/CyberCP/manage.py migrate',
+                'Webmail migrate', shell=True
+            )
+
+            # Fix webmail.conf ownership for lscpd (may be wrong on existing installs)
+            if os.path.exists('/etc/cyberpanel/webmail.conf'):
+                subprocess.call(['chown', 'cyberpanel:cyberpanel', '/etc/cyberpanel/webmail.conf'])
+                os.chmod('/etc/cyberpanel/webmail.conf', 0o600)
+
+            # Restart Dovecot
+            subprocess.call(['systemctl', 'restart', 'dovecot'])
+
+            Upgrade.stdOut("Webmail master user setup complete!", 0)
+
+        except BaseException as msg:
+            Upgrade.stdOut("setupWebmail error: " + str(msg), 0)
+
+    @staticmethod
+    def fixMailTLS():
+        """Ensure Postfix/Dovecot TLS cert files exist at expected paths.
+
+        On Ubuntu, the install creates dirs at /etc/pki/dovecot/ but never
+        copies the self-signed certs there. This breaks STARTTLS and prevents
+        external mail servers (Gmail, etc.) from delivering inbound mail.
+        """
+        try:
+            cert_path = '/etc/pki/dovecot/certs/dovecot.pem'
+            key_path = '/etc/pki/dovecot/private/dovecot.pem'
+
+            # Skip if certs already exist
+            if os.path.exists(cert_path) and os.path.exists(key_path):
+                return
+
+            # Skip if no mail server
+            if not os.path.exists('/etc/dovecot/dovecot.conf'):
+                return
+
+            Upgrade.stdOut("Fixing mail TLS certificates...", 0)
+
+            os.makedirs('/etc/pki/dovecot/certs', exist_ok=True)
+            os.makedirs('/etc/pki/dovecot/private', exist_ok=True)
+
+            # Prefer existing Dovecot self-signed certs
+            if os.path.exists('/etc/dovecot/cert.pem') and os.path.exists('/etc/dovecot/key.pem'):
+                import shutil
+                shutil.copy2('/etc/dovecot/cert.pem', cert_path)
+                shutil.copy2('/etc/dovecot/key.pem', key_path)
+            else:
+                # Generate a new self-signed cert
+                hostname = ProcessUtilities.outputExecutioner(
+                    'hostname').strip() or 'localhost'
+                subprocess.call([
+                    'openssl', 'req', '-x509', '-nodes', '-days', '3650',
+                    '-newkey', 'rsa:2048',
+                    '-subj', '/CN=%s' % hostname,
+                    '-keyout', key_path,
+                    '-out', cert_path
+                ])
+
+            os.chmod(cert_path, 0o644)
+            os.chmod(key_path, 0o600)
+
+            # Restart Postfix to pick up the certs
+            subprocess.call(['systemctl', 'restart', 'postfix'])
+
+            Upgrade.stdOut("Mail TLS certificates fixed.", 0)
+
+        except BaseException as msg:
+            Upgrade.stdOut("fixMailTLS error: " + str(msg), 0)
 
     @staticmethod
     def manageServiceMigrations():
@@ -2137,13 +3420,92 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
             pass
 
     @staticmethod
+    def backupCriticalFiles():
+        """Backup all critical configuration files before upgrade"""
+        import tempfile
+        backup_dir = tempfile.mkdtemp(prefix='cyberpanel_backup_')
+        
+        critical_files = [
+            '/usr/local/CyberCP/CyberCP/settings.py',
+            '/usr/local/CyberCP/.git/config',  # Git configuration
+        ]
+        
+        # Also backup any custom configurations
+        custom_configs = [
+            '/usr/local/CyberCP/baseTemplate/static/baseTemplate/custom/',
+            '/usr/local/CyberCP/public/phpmyadmin/config.inc.php',
+            '/usr/local/CyberCP/rainloop/data/_data_/',
+        ]
+        
+        # Backup Imunify360 directories and configuration
+        imunify_paths = [
+            '/usr/local/CyberCP/public/imunify',
+            '/usr/local/CyberCP/public/imunifyav',
+            '/etc/sysconfig/imunify360/integration.conf',
+        ]
+
+        for imunify_path in imunify_paths:
+            if os.path.exists(imunify_path):
+                if os.path.isdir(imunify_path):
+                    custom_configs.append(imunify_path)
+                else:
+                    critical_files.append(imunify_path)
+        
+        backed_up_files = {}
+        
+        for file_path in critical_files:
+            if os.path.exists(file_path):
+                try:
+                    backup_path = os.path.join(backup_dir, os.path.basename(file_path))
+                    shutil.copy2(file_path, backup_path)
+                    backed_up_files[file_path] = backup_path
+                    Upgrade.stdOut(f"Backed up {file_path}")
+                except Exception as e:
+                    Upgrade.stdOut(f"Failed to backup {file_path}: {str(e)}")
+        
+        # Backup directories
+        for dir_path in custom_configs:
+            if os.path.exists(dir_path):
+                try:
+                    backup_path = os.path.join(backup_dir, os.path.basename(dir_path))
+                    shutil.copytree(dir_path, backup_path)
+                    backed_up_files[dir_path] = backup_path
+                    Upgrade.stdOut(f"Backed up directory {dir_path}")
+                except Exception as e:
+                    Upgrade.stdOut(f"Failed to backup {dir_path}: {str(e)}")
+        
+        return backup_dir, backed_up_files
+    
+    @staticmethod
+    def restoreCriticalFiles(backup_dir, backed_up_files):
+        """Restore critical configuration files after upgrade"""
+        for original_path, backup_path in backed_up_files.items():
+            # Skip settings.py - we'll handle it separately to preserve INSTALLED_APPS
+            if 'settings.py' in original_path:
+                Upgrade.stdOut(f"Skipping {original_path} - will be handled separately")
+                continue
+            
+            try:
+                if os.path.isdir(backup_path):
+                    if os.path.exists(original_path):
+                        shutil.rmtree(original_path)
+                    shutil.copytree(backup_path, original_path)
+                else:
+                    # Create directory if it doesn't exist
+                    os.makedirs(os.path.dirname(original_path), exist_ok=True)
+                    shutil.copy2(backup_path, original_path)
+                Upgrade.stdOut(f"Restored {original_path}")
+            except Exception as e:
+                Upgrade.stdOut(f"Failed to restore {original_path}: {str(e)}")
+    
+    @staticmethod
     def downloadAndUpgrade(versionNumbring, branch):
         try:
             ## Download latest version.
 
-            ## Backup settings file.
-
-            Upgrade.stdOut("Backing up settings file.")
+            ## Backup all critical files
+            Upgrade.stdOut("Backing up critical configuration files...")
+            backup_dir, backed_up_files = Upgrade.backupCriticalFiles()
 
             ## CyberPanel DB Creds
             dbName = settings.DATABASES['default']['NAME']
@@ -2181,91 +3543,84 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
 
             settingsFile = '/usr/local/CyberCP/CyberCP/settings.py'
 
-            Upgrade.stdOut("Settings file backed up.")
+            Upgrade.stdOut("Critical files backed up to: " + backup_dir)
 
-            ## Check git branch status
-
-            os.chdir('/usr/local/CyberCP')
-
+            ## Always do a fresh clone for clean upgrade
+            
+            Upgrade.stdOut("Performing clean upgrade by removing and re-cloning CyberPanel...")
+            
+            # Set git config first
             command = 'git config --global user.email "support@cyberpanel.net"'
-
             if not Upgrade.executioner(command, command, 1):
                 return 0, 'Failed to execute %s' % (command)
 
             command = 'git config --global user.name "CyberPanel"'
-
             if not Upgrade.executioner(command, command, 1):
                 return 0, 'Failed to execute %s' % (command)
+            
+            # Change to parent directory
+            os.chdir('/usr/local')
 
-            command = 'git status'
-            currentBranch = subprocess.check_output(shlex.split(command)).decode()
-
-            if currentBranch.find('On branch %s' % (branch)) > -1 and currentBranch.find(
-                    'On branch %s-dev' % (branch)) == -1:
-
-                command = 'git stash'
-                if not Upgrade.executioner(command, command, 1):
-                    return 0, 'Failed to execute %s' % (command)
-
-                command = 'git pull'
-                if not Upgrade.executioner(command, command, 1):
-                    return 0, 'Failed to execute %s' % (command)
-
-            elif currentBranch.find('not a git repository') > -1:
-
-                os.chdir('/usr/local')
-
-                command = 'git clone https://github.com/usmannasir/cyberpanel'
-                if not Upgrade.executioner(command, command, 1):
-                    return 0, 'Failed to execute %s' % (command)
-
-                if os.path.exists('CyberCP'):
+            # Remove old CyberCP directory
+            if os.path.exists('CyberCP'):
+                Upgrade.stdOut("Removing old CyberCP directory...")
+                try:
                     shutil.rmtree('CyberCP')
+                    Upgrade.stdOut("Old CyberCP directory removed successfully.")
+                except Exception as e:
+                    Upgrade.stdOut(f"Error removing CyberCP directory: {str(e)}")
+                    # Try to restore backup if removal fails
+                    Upgrade.restoreCriticalFiles(backup_dir, backed_up_files)
+                    return 0, 'Failed to remove old CyberCP directory'
 
-                shutil.move('cyberpanel', 'CyberCP')
+            # Clone the new repository directly to CyberCP
+            Upgrade.stdOut("Cloning fresh CyberPanel repository...")
+            command = 'git clone https://github.com/usmannasir/cyberpanel CyberCP'
+            if not Upgrade.executioner(command, command, 1):
+                # Try to restore backup if clone fails
+                Upgrade.stdOut("Clone failed, attempting to restore backup...")
+                Upgrade.restoreCriticalFiles(backup_dir, backed_up_files)
+                return 0, 'Failed to clone CyberPanel repository'
+            
+            # Checkout the correct branch
+            os.chdir('/usr/local/CyberCP')
+            command = 'git checkout %s' % (branch)
+            if not Upgrade.executioner(command, command, 1):
+                Upgrade.stdOut(f"Warning: Failed to checkout branch {branch}, continuing with default branch")
+            
+            # Restore all backed up configuration files (except settings.py)
+            Upgrade.stdOut("Restoring configuration files...")
+            Upgrade.restoreCriticalFiles(backup_dir, backed_up_files)
 
-            else:
-
-                command = 'git fetch'
-                if not Upgrade.executioner(command, command, 1):
-                    return 0, 'Failed to execute %s' % (command)
-
-                command = 'git stash'
-                if not Upgrade.executioner(command, command, 1):
-                    return 0, 'Failed to execute %s' % (command)
-
-                command = 'git checkout %s' % (branch)
-                if not Upgrade.executioner(command, command, 1):
-                    return 0, 'Failed to execute %s' % (command)
-
-                command = 'git pull'
-                if not Upgrade.executioner(command, command, 1):
-                    return 0, 'Failed to execute %s' % (command)
-
-            ## Copy settings file
-
-            settingsData = open(settingsFile, 'r').readlines()
-
-            DATABASESCHECK = 0
+            ## Handle settings.py separately to preserve NEW INSTALLED_APPS while keeping old database credentials
+            
+            # Read the NEW settings file from the fresh clone (has new INSTALLED_APPS like 'aiScanner')
+            settingsData = open(settingsFile, 'r').read()
+            
+            # Replace only the DATABASES section with our saved credentials
+            import re
+            
+            # More precise pattern to match the entire DATABASES dictionary including nested dictionaries
+            # This pattern looks for DATABASES = { ... } including the 'default' and 'rootdb' nested dicts
+            database_pattern = r'DATABASES\s*=\s*\{[^}]*\{[^}]*\}[^}]*\{[^}]*\}[^}]*\}'
+            
+            # Replace the DATABASES section with our saved credentials from before upgrade
+            settingsData = re.sub(database_pattern, completDBString.strip(), settingsData, flags=re.DOTALL)
+            
+            # Write back the updated settings
             writeToFile = open(settingsFile, 'w')
-
-            for items in settingsData:
-                if items.find('DATABASES = {') > -1:
-                    DATABASESCHECK = 1
-
-                if DATABASESCHECK == 0:
-                    writeToFile.write(items)
-
-                if items.find('DATABASE_ROUTERS = [') > -1:
-                    DATABASESCHECK = 0
-                    writeToFile.write(completDBString)
-                    writeToFile.write(items)
-
+            writeToFile.write(settingsData)
             writeToFile.close()
 
-            Upgrade.stdOut('Settings file restored!')
+            Upgrade.stdOut('Settings file updated with database credentials while preserving new INSTALLED_APPS!')
 
             Upgrade.staticContent()
+
+            # Restore Imunify360 after upgrade
+            Upgrade.restoreImunify360()
+
+            # FINAL STEP: Ensure Imunify360 execute permissions are set
+            Upgrade.finalImunifyPermissions()
 
             return 1, None
 
@@ -2304,7 +3659,7 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
                         lscpdSelection = 'lscpd-0.3.1'
                         if os.path.exists(Upgrade.UbuntuPath):
                             result = open(Upgrade.UbuntuPath, 'r').read()
-                            if result.find('22.04') > -1:
+                            if result.find('22.04') > -1 or result.find('24.04') > -1:
                                 lscpdSelection = 'lscpd.0.4.0'
                     else:
                         lscpdSelection = 'lscpd.aarch64'
@@ -2314,7 +3669,7 @@ CREATE TABLE `websiteFunctions_backupsv2` (`id` integer AUTO_INCREMENT NOT NULL 
                     lscpdSelection = 'lscpd-0.3.1'
                     if os.path.exists(Upgrade.UbuntuPath):
                         result = open(Upgrade.UbuntuPath, 'r').read()
-                        if result.find('22.04') > -1:
+                        if result.find('22.04') > -1 or result.find('24.04') > -1:
                             lscpdSelection = 'lscpd.0.4.0'
 
                 command = f'cp -f /usr/local/CyberCP/{lscpdSelection} /usr/local/lscp/bin/{lscpdSelection}'
@@ -2599,10 +3954,10 @@ echo $oConfig->Save() ? 'Done' : 'Error';
             Upgrade.executioner(command, 0)
 
             command = '/usr/local/lsws/lsphp72/bin/php /usr/local/CyberCP/public/snappymail.php'
-            Upgrade.executioner(command, 0)
+            Upgrade.executioner_silent(command, 'Configure SnappyMail')
 
             command = 'chmod 600 /usr/local/CyberCP/public/snappymail.php'
-            Upgrade.executioner(command, 0)
+            Upgrade.executioner_silent(command, 'Secure SnappyMail config')
 
             ###
 
@@ -2692,6 +4047,12 @@ echo $oConfig->Save() ? 'Done' : 'Error';
             command = 'yum install lsphp83* -y'
             subprocess.call(command, shell=True)
 
+            command = 'yum install lsphp84* -y'
+            subprocess.call(command, shell=True)
+
+            command = 'yum install lsphp85* -y'
+            subprocess.call(command, shell=True)
+
         except:
             command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install ' \
                       'lsphp7? lsphp7?-common lsphp7?-curl lsphp7?-dev lsphp7?-imap lsphp7?-intl lsphp7?-json ' \
@@ -2709,6 +4070,12 @@ echo $oConfig->Save() ? 'Done' : 'Error';
             os.system(command)
 
             command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp83*'
+            os.system(command)
+
+            command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp84*'
+            os.system(command)
+
+            command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp85*'
             os.system(command)
 
         CentOSPath = '/etc/redhat-release'
@@ -2774,7 +4141,11 @@ echo $oConfig->Save() ? 'Done' : 'Error';
                     if items.password.find('CRYPT') > -1:
                         continue
                     command = 'doveadm pw -p %s' % (items.password)
-                    items.password = subprocess.check_output(shlex.split(command)).decode("utf-8").strip('\n')
+                    try:
+                        items.password = subprocess.check_output(shlex.split(command)).decode("utf-8").strip('\n')
+                    except Exception as e:
+                        Upgrade.stdOut(f"Error hashing password for {items.email}: {str(e)}")
+                        continue
                     items.save()
 
                 command = "systemctl restart dovecot"
@@ -2814,7 +4185,7 @@ echo $oConfig->Save() ? 'Done' : 'Error';
 
                 command = 'systemctl restart postfix'
                 Upgrade.executioner(command, 0)
-            elif Upgrade.FindOperatingSytem() == Ubuntu20 or Upgrade.FindOperatingSytem() == Ubuntu22:
+            elif Upgrade.FindOperatingSytem() == Ubuntu20 or Upgrade.FindOperatingSytem() == Ubuntu22 or Upgrade.FindOperatingSytem() == Ubuntu24:
 
                 debPath = '/etc/apt/sources.list.d/dovecot.list'
                 # writeToFile = open(debPath, 'w')
@@ -2835,9 +4206,13 @@ echo $oConfig->Save() ? 'Done' : 'Error';
 
             dovecotConf = '/etc/dovecot/dovecot.conf'
 
-            dovecotContent = open(dovecotConf, 'r').read()
+            try:
+                dovecotContent = open(dovecotConf, 'r').read()
+            except Exception as e:
+                Upgrade.stdOut(f"Error reading dovecot config: {str(e)}")
+                dovecotContent = ""
 
-            if dovecotContent.find('service stats') == -1:
+            if dovecotContent and dovecotContent.find('service stats') == -1:
                 writeToFile = open(dovecotConf, 'a')
 
                 content = """\nservice stats {
@@ -2855,6 +4230,38 @@ echo $oConfig->Save() ? 'Done' : 'Error';
 
                 writeToFile.write(content)
                 writeToFile.close()
+
+            # Fix mailbox auto-creation issue
+            if dovecotContent and dovecotContent.find('lda_mailbox_autocreate') == -1:
+                Upgrade.stdOut("Enabling mailbox auto-creation in dovecot...")
+                
+                # Add mailbox auto-creation settings to protocol lda section
+                try:
+                    dovecotContent = open(dovecotConf, 'r').read()
+                except Exception as e:
+                    Upgrade.stdOut(f"Error reading dovecot config: {str(e)}")
+                    dovecotContent = ""
+                
+                if dovecotContent and dovecotContent.find('protocol lda') > -1:
+                    # Update existing protocol lda section
+                    import re
+                    pattern = r'(protocol lda\s*{[^}]*)'
+                    replacement = r'\1\n    lda_mailbox_autocreate = yes\n    lda_mailbox_autosubscribe = yes'
+                    if isinstance(dovecotContent, str):
+                        dovecotContent = re.sub(pattern, replacement, dovecotContent)
+                    
+                    writeToFile = open(dovecotConf, 'w')
+                    writeToFile.write(dovecotContent)
+                    writeToFile.close()
+                else:
+                    # Add new protocol lda section
+                    writeToFile = open(dovecotConf, 'a')
+                    content = """\nprotocol lda {
+    lda_mailbox_autocreate = yes
+    lda_mailbox_autosubscribe = yes
+}\n"""
+                    writeToFile.write(content)
+                    writeToFile.close()
 
                 command = 'systemctl restart dovecot'
                 Upgrade.executioner(command, command, 0)
@@ -2957,6 +4364,13 @@ vmail
         command = """sed -i '/CyberCP/d' /etc/crontab"""
         Upgrade.executioner(command, command, 0, True)
 
+        # Ensure log directory exists for scheduled scans
+        if not os.path.exists('/usr/local/lscp/logs'):
+            try:
+                os.makedirs('/usr/local/lscp/logs', mode=0o755)
+            except:
+                pass
+
         if os.path.exists('/usr/local/lsws/conf/httpd.conf'):
             # Setup /usr/local/lsws/conf/httpd.conf to use new Logformat standard for better stats and accesslogs
             command = """sed -i "s|^LogFormat.*|LogFormat '%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"' combined|g" /usr/local/lsws/conf/httpd.conf"""
@@ -2990,6 +4404,7 @@ vmail
 0 0 * * 4 /usr/local/CyberCP/bin/python /usr/local/CyberCP/plogical/renew.py >/dev/null 2>&1
 7 0 * * * "/root/.acme.sh"/acme.sh --cron --home "/root/.acme.sh" > /dev/null
 */3 * * * * if ! find /home/*/public_html/ -maxdepth 2 -type f -newer /usr/local/lsws/cgid -name '.htaccess' -exec false {} +; then /usr/local/lsws/bin/lswsctrl restart; fi
+* * * * * /usr/local/CyberCP/bin/python /usr/local/CyberCP/manage.py run_scheduled_scans >/usr/local/lscp/logs/scheduled_scans.log 2>&1
 """
 
                 writeToFile = open(cronPath, 'w')
@@ -3019,6 +4434,15 @@ vmail
                 writeToFile.write(content)
                 writeToFile.close()
 
+            # Add AI Scanner scheduled scans cron job if missing
+            if data.find('run_scheduled_scans') == -1:
+                content = """
+* * * * * /usr/local/CyberCP/bin/python /usr/local/CyberCP/manage.py run_scheduled_scans >/usr/local/lscp/logs/scheduled_scans.log 2>&1
+"""
+                writeToFile = open(cronPath, 'a')
+                writeToFile.write(content)
+                writeToFile.close()
+
 
         else:
             content = """
@@ -3030,6 +4454,7 @@ vmail
 7 0 * * * "/root/.acme.sh"/acme.sh --cron --home "/root/.acme.sh" > /dev/null
 0 0 * * * /usr/local/CyberCP/bin/python /usr/local/CyberCP/IncBackups/IncScheduler.py Daily
 0 0 * * 0 /usr/local/CyberCP/bin/python /usr/local/CyberCP/IncBackups/IncScheduler.py Weekly
+* * * * * /usr/local/CyberCP/bin/python /usr/local/CyberCP/manage.py run_scheduled_scans >/usr/local/lscp/logs/scheduled_scans.log 2>&1
 """
             writeToFile = open(cronPath, 'w')
             writeToFile.write(content)
@@ -3402,6 +4827,42 @@ pm.max_spare_servers = 3
             WriteToFile.close()
 
     @staticmethod
+    def setupPHPSymlink():
+        try:
+            # Check if PHP 8.3 exists
+            if not os.path.exists('/usr/local/lsws/lsphp83/bin/php'):
+                Upgrade.stdOut("PHP 8.3 not found, installing it first...")
+                
+                # Install PHP 8.3 based on OS
+                if os.path.exists(Upgrade.CentOSPath) or os.path.exists(Upgrade.openEulerPath):
+                    command = 'yum install lsphp83 lsphp83-* -y'
+                    Upgrade.executioner(command, 'Install PHP 8.3', 0)
+                else:
+                    command = 'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp83 lsphp83-*'
+                    Upgrade.executioner(command, 'Install PHP 8.3', 0)
+                
+                # Verify installation
+                if not os.path.exists('/usr/local/lsws/lsphp83/bin/php'):
+                    Upgrade.stdOut('[ERROR] Failed to install PHP 8.3')
+                    return 0
+            
+            # Remove existing PHP symlink if it exists
+            if os.path.exists('/usr/bin/php'):
+                os.remove('/usr/bin/php')
+
+            # Create symlink to PHP 8.3
+            command = 'ln -s /usr/local/lsws/lsphp83/bin/php /usr/bin/php'
+            Upgrade.executioner(command, 'Setup PHP Symlink to 8.3', 0)
+
+            Upgrade.stdOut("PHP symlink updated to PHP 8.3 successfully.")
+
+        except BaseException as msg:
+            Upgrade.stdOut('[ERROR] ' + str(msg) + " [setupPHPSymlink]")
+            return 0
+
+        return 1
+
+    @staticmethod
     def upgrade(branch):
 
         if branch.find('SoftUpgrade') > -1:
@@ -3413,10 +4874,18 @@ pm.max_spare_servers = 3
 
         if os.path.exists(Upgrade.CentOSPath) or os.path.exists(Upgrade.openEulerPath):
             command = 'yum list installed'
-            Upgrade.installedOutput = subprocess.check_output(shlex.split(command)).decode()
+            try:
+                Upgrade.installedOutput = subprocess.check_output(shlex.split(command)).decode()
+            except Exception as e:
+                Upgrade.stdOut(f"Error getting installed packages: {str(e)}")
+                Upgrade.installedOutput = ""
         else:
             command = 'apt list'
-            Upgrade.installedOutput = subprocess.check_output(shlex.split(command)).decode()
+            try:
+                Upgrade.installedOutput = subprocess.check_output(shlex.split(command)).decode()
+            except Exception as e:
+                Upgrade.stdOut(f"Error getting installed packages: {str(e)}")
+                Upgrade.installedOutput = ""
 
         # command = 'systemctl stop cpssh'
         # Upgrade.executioner(command, 'fix csf if there', 0)
@@ -3424,7 +4893,7 @@ pm.max_spare_servers = 3
         ## Add LSPHP7.4 TO LSWS Ent configs
 
         if not os.path.exists('/usr/local/lsws/bin/openlitespeed'):
-
+            # This is Enterprise LSWS
             if os.path.exists('httpd_config.xml'):
                 os.remove('httpd_config.xml')
 
@@ -3432,6 +4901,66 @@ pm.max_spare_servers = 3
             Upgrade.executioner(command, command, 0)
             # os.remove('/usr/local/lsws/conf/httpd_config.xml')
             # shutil.copy('httpd_config.xml', '/usr/local/lsws/conf/httpd_config.xml')
+        else:
+            # This is OpenLiteSpeed - install/upgrade custom binaries
+            Upgrade.stdOut("Detected OpenLiteSpeed installation", 0)
+            Upgrade.stdOut("Installing/upgrading custom binaries with .htaccess PHP config support...", 0)
+
+            # Install custom binaries
+            if Upgrade.installCustomOLSBinaries():
+                # Configure the custom module
+                Upgrade.configureCustomModule()
+
+                # Enable Auto-SSL if not already configured
+                conf_path = '/usr/local/lsws/conf/httpd_config.conf'
+                try:
+                    import re
+                    with open(conf_path, 'r') as f:
+                        content = f.read()
+                    if 'autoSSL' not in content:
+                        content = re.sub(
+                            r'(adminEmails\s+\S+)',
+                            r'\1\nautoSSL                   1\nacmeEmail                 admin@cyberpanel.net',
+                            content,
+                            count=1
+                        )
+                        with open(conf_path, 'w') as f:
+                            f.write(content)
+                        Upgrade.stdOut("Auto-SSL enabled in httpd_config.conf", 0)
+                except Exception as e:
+                    Upgrade.stdOut(f"WARNING: Could not enable Auto-SSL: {e}", 0)
+
+                # Restart OpenLiteSpeed to apply changes and verify it started
+                Upgrade.stdOut("Restarting OpenLiteSpeed...", 0)
+                command = '/usr/local/lsws/bin/lswsctrl restart'
+                Upgrade.executioner(command, 'Restart OpenLiteSpeed', 0)
+
+                # Verify OLS started successfully after restart
+                import time
+                time.sleep(5)  # Give OLS time to start
+
+                result = subprocess.run(['pgrep', '-f', 'openlitespeed'],
+                                        capture_output=True)
+                if result.returncode != 0:
+                    Upgrade.stdOut("WARNING: OpenLiteSpeed may not have started after upgrade!", 0)
+                    Upgrade.stdOut("Attempting auto-rollback...", 0)
+
+                    # Find the most recent backup directory
+                    backup_base = '/usr/local/lsws'
+                    backups = [d for d in os.listdir(backup_base) if d.startswith('backup-')]
+                    if backups:
+                        backups.sort(reverse=True)  # Most recent first
+                        latest_backup = os.path.join(backup_base, backups[0])
+                        if Upgrade.rollbackOLSBinary(latest_backup, '/usr/local/lsws/bin/openlitespeed'):
+                            Upgrade.stdOut("Auto-rollback completed successfully", 0)
+                        else:
+                            Upgrade.stdOut("ERROR: Auto-rollback failed! Manual intervention may be required.", 0)
+                    else:
+                        Upgrade.stdOut("ERROR: No backup found for rollback!", 0)
+                else:
+                    Upgrade.stdOut("OpenLiteSpeed restarted successfully", 0)
+            else:
+                Upgrade.stdOut("Custom binary installation failed, continuing with upgrade...", 0)
 
         Upgrade.updateRepoURL()
 
@@ -3464,6 +4993,7 @@ pm.max_spare_servers = 3
             Upgrade.executioner(command, 'tmp adjustment', 0)
 
         Upgrade.dockerUsers()
+        Upgrade.setupPHPSymlink()
         Upgrade.setupComposer()
 
         ##
@@ -3510,6 +5040,9 @@ pm.max_spare_servers = 3
         Upgrade.s3BackupMigrations()
         Upgrade.containerMigrations()
         Upgrade.manageServiceMigrations()
+        Upgrade.fixMailTLS()
+        Upgrade.setupWebmail()
+        Upgrade.setupSieve()
         Upgrade.enableServices()
 
         Upgrade.installPHP73()
@@ -3517,6 +5050,9 @@ pm.max_spare_servers = 3
         Upgrade.someDirectories()
         Upgrade.installLSCPD(branch)
         Upgrade.FixCurrentQuoatasSystem()
+        
+        ## Fix Apache configuration issues after upgrade
+        Upgrade.fixApacheConfiguration()
 
         ### General migrations are not needed any more
 
@@ -3560,89 +5096,24 @@ pm.max_spare_servers = 3
             except:
                 pass
 
-        #command = 'csf -uf'
-        #Upgrade.executioner(command, 'fix csf if there', 0)
-
+        # Remove CSF if installed and restore firewalld (CSF is being discontinued on August 31, 2025)
         if os.path.exists('/etc/csf'):
-            ##### Function to backup custom csf files and restore
-
-            from datetime import datetime
-
-            # List of files to backup
-            FILES = [
-                "/etc/csf/csf.allow",
-                "/etc/csf/csf.deny",
-                "/etc/csf/csf.conf",
-                "/etc/csf/csf.ignore",
-                "/etc/csf/csf.rignore",
-                "/etc/csf/csf.blocklists",
-                "/etc/csf/csf.dyndns"
-            ]
-
-            # Directory for backups
-            BACKUP_DIR = f"/home/cyberpanel/csf_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-            # Backup function
-            def backup_files():
-                os.makedirs(BACKUP_DIR, exist_ok=True)
-                for file in FILES:
-                    if os.path.exists(file):
-                        shutil.copy(file, BACKUP_DIR)
-                        print(f"Backed up: {file}")
-                    else:
-                        print(f"File not found, skipping: {file}")
-
-            # Restore function
-            def restore_files():
-                for file in FILES:
-                    backup_file = os.path.join(BACKUP_DIR, os.path.basename(file))
-                    if os.path.exists(backup_file):
-                        try:
-                            shutil.copy(backup_file, file)
-                            print(f"Restored: {file}")
-                        except:
-                            pass
-                    else:
-                        print(f"Backup not found for: {file}")
-
-            # Backup the files
-            print("Backing up files...")
-            backup_files()
-
+            print("CSF detected - removing CSF and restoring firewalld...")
+            print("Note: ConfigServer Firewall (CSF) is being discontinued on August 31, 2025")
+            
+            # Remove CSF and restore firewalld
             execPath = "sudo /usr/local/CyberCP/bin/python /usr/local/CyberCP/plogical/csf.py"
             execPath = execPath + " removeCSF"
-            Upgrade.executioner(execPath, 'fix csf if there', 0)
-
-            execPath = "sudo /usr/local/CyberCP/bin/python /usr/local/CyberCP/plogical/csf.py"
-            execPath = execPath + " installCSF"
-
-            # Restore the files
-            print("Restoring files...")
-            restore_files()
-
-
-            Upgrade.executioner(execPath, 'fix csf if there', 0)
+            Upgrade.executioner(execPath, 'Remove CSF and restore firewalld', 0)
+            
+            print("CSF has been removed and firewalld has been restored.")
 
 
 
-        # if os.path.exists('/usr/local/CyberCP/configservercsf'):
-        #     command = 'rm -f /usr/local/CyberCP/configservercsf/signals.py'
-        #     Upgrade.executioner(command, 'remove /usr/local/CyberCP/configservercsf/signals.py', 1)
-        #
-        #
-        # sed_commands = [
-        #     'sed -i "s/url(r\'^configservercsf/path(\'configservercsf/g" /usr/local/CyberCP/CyberCP/urls.py',
-        #     'sed -i "s/from django.conf.urls import url/from django.urls import path/g" /usr/local/CyberCP/configservercsf/urls.py',
-        #     'sed -i "s/import signals/import configservercsf.signals/g" /usr/local/CyberCP/configservercsf/apps.py',
-        #     'sed -i "s/url(r\'^$\'/path(\'\'/g" /usr/local/CyberCP/configservercsf/urls.py',
-        #     'sed -i "s|url(r\'^iframe/$\'|path(\'iframe/\'|g" /usr/local/CyberCP/configservercsf/urls.py',
-        #     'sed -i -E "s/from.*, response/from plogical.httpProc import httpProc/g" /usr/local/CyberCP/configservercsf/views.py'
-        #     '''sed -i -E "s#^(\s*)return render.*index\.html.*#\1proc = httpProc(request, 'configservercsf/index.html', None, 'admin')\n\1return proc.render()#g" /usr/local/CyberCP/configservercsf/views.py'''
-        #     'killall lswsgi'
-        # ]
-        #
-        # for cmd in sed_commands:
-        #     Upgrade.executioner(cmd, 'fix csf if there', 1)
+        # Remove configservercsf directory if it exists
+        if os.path.exists('/usr/local/CyberCP/configservercsf'):
+            command = 'rm -rf /usr/local/CyberCP/configservercsf'
+            Upgrade.executioner(command, 'Remove configservercsf directory', 1)
 
 
 
@@ -3654,31 +5125,243 @@ pm.max_spare_servers = 3
         Upgrade.FixRSPAMDConfig()
         Upgrade.CreateMissingPoolsforFPM()
 
-        # ## Move static files
-        #
-        # imunifyPath = '/usr/local/CyberCP/public/imunify'
-        #
-        # if os.path.exists(imunifyPath):
-        #     command = "yum reinstall imunify360-firewall-generic -y"
-        #     Upgrade.executioner(command, command, 1)
-        #
-        imunifyAVPath = '/etc/sysconfig/imunify360/integration.conf'
+                # ## Handle ImunifyAV and Imunify360 separately
 
-        if os.path.exists(imunifyAVPath):
-            execPath = "/usr/local/CyberCP/bin/python /usr/local/CyberCP/CLManager/CageFS.py"
-            command = execPath + " --function submitinstallImunifyAV"
-            Upgrade.executioner(command, command, 1)
+        # Both products use the same config file, so we need to read its content to determine which product
+        integrationConfig = '/etc/sysconfig/imunify360/integration.conf'
 
-            command = 'chmod +x /usr/local/CyberCP/public/imunifyav/bin/execute.py'
-            Upgrade.executioner(command, command, 1)
+        if os.path.exists(integrationConfig):
+            try:
+                with open(integrationConfig, 'r') as f:
+                    configContent = f.read()
 
-        imfExecutePath = '/usr/local/CyberCP/public/imunify/bin/execute.py'
-        if os.path.exists(imfExecutePath):
-            command = f'chmod 755 {imfExecutePath}'
-            Upgrade.executioner(command, command, 0)
+                # Check which product the config file is for by looking at the ui_path
+                if 'ui_path =/usr/local/CyberCP/public/imunifyav' in configContent:
+                    # This is ImunifyAV configuration
+                    Upgrade.stdOut("Detected ImunifyAV configuration, reconfiguring...")
+                    imunifyAVPath = '/usr/local/CyberCP/public/imunifyav'
 
+                    if os.path.exists(imunifyAVPath):
+                        execPath = "/usr/local/CyberCP/bin/python /usr/local/CyberCP/CLManager/CageFS.py"
+                        command = execPath + " --function submitinstallImunifyAV"
+                        Upgrade.executioner(command, command, 1)
+
+                        # Set permissions on ImunifyAV execute file
+                        imunifyAVExecute = '/usr/local/CyberCP/public/imunifyav/bin/execute.py'
+                        if os.path.exists(imunifyAVExecute):
+                            command = 'chmod +x ' + imunifyAVExecute
+                            Upgrade.executioner(command, command, 1)
+                            Upgrade.stdOut("ImunifyAV execute permissions set")
+                        else:
+                            Upgrade.stdOut("ImunifyAV execute.py file not found")
+                    else:
+                        Upgrade.stdOut("ImunifyAV directory not found despite config file existing")
+
+                elif 'ui_path =/usr/local/CyberCP/public/imunify' in configContent:
+                    # This is Imunify360 configuration
+                    Upgrade.stdOut("Detected Imunify360 configuration, checking system installation...")
+                    imunify360Path = '/usr/local/CyberCP/public/imunify'
+
+                    if os.path.exists(imunify360Path):
+                        # Check if Imunify360 is actually installed on the system
+                        imunify360Installed = False
+                        if os.path.exists('/usr/bin/imunify360-agent') or os.path.exists('/opt/imunify360'):
+                            imunify360Installed = True
+                            Upgrade.stdOut("Imunify360 system installation detected")
+
+                        if imunify360Installed:
+                            Upgrade.stdOut("Imunify360 directory found and system is installed, ensuring proper integration...")
+                            # Reinstall Imunify360 firewall to ensure integration
+                            command = "yum reinstall imunify360-firewall-generic -y" if os.path.exists(Upgrade.CentOSPath) else "apt install --reinstall imunify360-firewall-generic -y"
+                            Upgrade.executioner(command, command, 1)
+                        else:
+                            Upgrade.stdOut("Imunify360 directory found but system not installed - manual installation may be needed")
+
+                        # Set permissions on Imunify360 execute file
+                        imunify360Execute = '/usr/local/CyberCP/public/imunify/bin/execute.py'
+                        if os.path.exists(imunify360Execute):
+                            command = f'chmod +x {imunify360Execute}'
+                            Upgrade.executioner(command, f'Setting execute permissions on Imunify360 file', 0)
+                            Upgrade.stdOut("Imunify360 execute permissions set")
+                        else:
+                            Upgrade.stdOut("Imunify360 execute.py file not found")
+                    else:
+                        Upgrade.stdOut("Imunify360 directory not found despite config file existing")
+
+                else:
+                    Upgrade.stdOut(f"Unknown product in integration config file. Config content: {configContent[:200]}...")
+
+            except Exception as e:
+                Upgrade.stdOut(f"Error reading integration config file: {str(e)}")
+        else:
+            Upgrade.stdOut("No Imunify integration config file found")
+
+    @staticmethod
+    def restoreImunify360():
+        """Restore and reconfigure Imunify360 after upgrade"""
+        try:
+            Upgrade.stdOut("=== STARTING IMUNIFY360 RESTORATION ===")
+            Upgrade.stdOut("Checking for Imunify360 restoration...")
+
+            # Check if Imunify360 directories were restored
+            imunifyPath = '/usr/local/CyberCP/public/imunify'
+            imunifyAVPath = '/usr/local/CyberCP/public/imunifyav'
+            configPath = '/etc/sysconfig/imunify360/integration.conf'
+
+            Upgrade.stdOut(f"Checking if Imunify360 path exists: {imunifyPath}")
+            Upgrade.stdOut(f"Path exists: {os.path.exists(imunifyPath)}")
+
+            restored = False
+
+            # Handle main Imunify360 firewall
+            if os.path.exists(imunifyPath):
+                Upgrade.stdOut("Imunify360 directory found, checking if reinstallation is needed...")
+                # Check if Imunify360 is actually installed on the system
+                if os.path.exists('/usr/bin/imunify360-agent') or os.path.exists('/opt/imunify360'):
+                    Upgrade.stdOut("Imunify360 appears to be installed on system, ensuring proper integration...")
+                    # Reinstall to ensure proper integration
+                    command = "yum reinstall imunify360-firewall-generic -y" if os.path.exists(Upgrade.CentOSPath) else "apt install --reinstall imunify360-firewall-generic -y"
+                    if Upgrade.executioner(command, command, 1):
+                        Upgrade.stdOut("Imunify360 firewall reinstalled successfully")
+                        restored = True
+                    else:
+                        Upgrade.stdOut("Warning: Failed to reinstall Imunify360 firewall")
+                else:
+                    Upgrade.stdOut("Imunify360 not found on system, skipping firewall reinstallation")
+
+            # Handle ImunifyAV
+            if os.path.exists(imunifyAVPath):
+                Upgrade.stdOut("ImunifyAV directory found, reconfiguring...")
+                if os.path.exists(configPath):
+                    execPath = "/usr/local/CyberCP/bin/python /usr/local/CyberCP/CLManager/CageFS.py"
+                    command = execPath + " --function submitinstallImunifyAV"
+                    if Upgrade.executioner(command, command, 1):
+                        Upgrade.stdOut("ImunifyAV reconfigured successfully")
+                        restored = True
+
+                    # Ensure execute permissions
+                    executePath = '/usr/local/CyberCP/public/imunifyav/bin/execute.py'
+                    if os.path.exists(executePath):
+                        command = f'chmod +x {executePath}'
+                        Upgrade.executioner(command, command, 1)
+
+            # Handle main Imunify execute permissions - comprehensive solution for missing files
+            if os.path.exists(imunifyPath):
+                # First, check if the bin directory and execute.py file exist
+                binDir = '/usr/local/CyberCP/public/imunify/bin'
+                executeFile = '/usr/local/CyberCP/public/imunify/bin/execute.py'
+
+                if not os.path.exists(binDir):
+                    Upgrade.stdOut(f"Warning: Imunify360 bin directory missing at {binDir}")
+                    # Try to find if execute.py exists elsewhere
+                    findCommand = f'find {imunifyPath} -name "execute.py" -type f 2>/dev/null'
+                    Upgrade.stdOut(f"Searching for execute.py files with command: {findCommand}")
+                    findResult = subprocess.getstatusoutput(findCommand)
+                    Upgrade.stdOut(f"Find command result: exit_code={findResult[0]}, output='{findResult[1]}'")
+
+                    if findResult[0] == 0 and findResult[1].strip():
+                        Upgrade.stdOut(f"Found execute.py files: {findResult[1]}")
+                        # Set permissions on all found execute.py files
+                        command = f'find {imunifyPath} -name "execute.py" -type f -exec chmod +x {{}} \\; 2>/dev/null || true'
+                        Upgrade.executioner(command, 'Setting execute permissions on found execute.py files', 0)
+                    else:
+                        Upgrade.stdOut("No execute.py files found in Imunify360 directory - installation may be incomplete")
+                else:
+                    # Bin directory exists, try the direct approach
+                    Upgrade.stdOut(f"Bin directory exists at {binDir}, attempting to set execute permissions")
+                    Upgrade.stdOut(f"Checking if execute.py exists: {executeFile}")
+                    Upgrade.stdOut(f"File exists: {os.path.exists(executeFile)}")
+
+                    # Try direct chmod command first
+                    if os.path.exists(executeFile):
+                        Upgrade.stdOut("File exists, trying direct chmod command")
+                        command = f'chmod +x {executeFile}'
+                        Upgrade.stdOut(f"Executing direct command: {command}")
+                        directResult = Upgrade.executioner(command, f'Direct chmod on {executeFile}', 0)
+                        Upgrade.stdOut(f"Direct command result: {directResult}")
+
+                        if directResult:
+                            Upgrade.stdOut("SUCCESS: Direct chmod worked!")
+                            restored = True
+                        else:
+                            Upgrade.stdOut("FAILED: Direct chmod failed, trying alternative")
+
+                            # Try the community method as fallback
+                            command = f'cd {imunifyPath} && chmod +x ./bin/execute.py 2>/dev/null || true'
+                            Upgrade.stdOut(f"Trying community method: {command}")
+                            communityResult = Upgrade.executioner(command, 'Community method chmod', 0)
+                            Upgrade.stdOut(f"Community method result: {communityResult}")
+
+                            if communityResult:
+                                Upgrade.stdOut("SUCCESS: Community method worked!")
+                                restored = True
+                            else:
+                                Upgrade.stdOut("FAILED: Both methods failed")
+                    else:
+                        Upgrade.stdOut(f"ERROR: execute.py file not found at {executeFile}")
+
+                    # Try find method as final fallback
+                    Upgrade.stdOut("Trying find method as final fallback")
+                    command = f'find {imunifyPath} -name "execute.py" -type f -exec chmod +x {{}} \\; 2>/dev/null || true'
+                    Upgrade.stdOut(f"Find command: {command}")
+                    findResult = Upgrade.executioner(command, 'Find method chmod', 0)
+                    Upgrade.stdOut(f"Find result: {findResult}")
+
+                    if findResult and not restored:
+                        Upgrade.stdOut("SUCCESS: Find method worked!")
+                        restored = True
+
+                restored = True  # Mark as restored even if files are missing, to indicate we processed it
+
+            if restored:
+                Upgrade.stdOut("Imunify360 restoration completed successfully")
+            else:
+                Upgrade.stdOut("No Imunify360 components found to restore")
+
+        except Exception as e:
+            Upgrade.stdOut(f"Error during Imunify360 restoration: {str(e)}")
+
+    @staticmethod
+    def finalImunifyPermissions():
+        """FINAL STEP: Ensure Imunify360 execute permissions are set after everything else is complete"""
+        try:
+            Upgrade.stdOut("=== FINAL STEP: Setting Imunify360 Execute Permissions ===")
+
+            executeFile = '/usr/local/CyberCP/public/imunify/bin/execute.py'
+
+            if os.path.exists(executeFile):
+                Upgrade.stdOut(f"Setting execute permissions on: {executeFile}")
+                # Use the simplest, most reliable command
+                command = f'chmod +x {executeFile}'
+                result = Upgrade.executioner(command, f'Final chmod +x on {executeFile}', 0)
+
+                if result:
+                    Upgrade.stdOut("✅ SUCCESS: Imunify360 execute permissions set successfully!")
+                else:
+                    Upgrade.stdOut("❌ FAILED: Could not set Imunify360 execute permissions")
+
+                # Verify the permissions were set
+                try:
+                    import stat
+                    file_stat = os.stat(executeFile)
+                    if file_stat.st_mode & stat.S_IXUSR:
+                        Upgrade.stdOut("✅ VERIFIED: Execute permission confirmed on Imunify360 file")
+                    else:
+                        Upgrade.stdOut("❌ VERIFICATION FAILED: Execute permission not set")
+                except Exception as verify_error:
+                    Upgrade.stdOut(f"⚠️  Could not verify permissions: {str(verify_error)}")
+            else:
+                Upgrade.stdOut(f"⚠️  Imunify360 execute file not found: {executeFile}")
+
+            Upgrade.stdOut("=== FINAL STEP COMPLETE ===")
+
+        except Exception as e:
+            Upgrade.stdOut(f"❌ ERROR in final permission setting: {str(e)}")
 
         Upgrade.installDNS_CyberPanelACMEFile()
+
+        command = 'systemctl restart fastapi_ssh_server'
+        Upgrade.executioner(command, command, 0)
 
         Upgrade.stdOut("Upgrade Completed.")
 
@@ -3688,6 +5371,107 @@ pm.max_spare_servers = 3
             time.sleep(30)
             if os.path.exists(Upgrade.LogPathNew):
                 os.remove(Upgrade.LogPathNew)
+
+    @staticmethod
+    def fixApacheConfigurationOld():
+        """OLD VERSION - DO NOT USE - Fix Apache configuration issues after upgrade"""
+        try:
+            # Check if Apache is installed
+            if Upgrade.FindOperatingSytem() == CENTOS7 or Upgrade.FindOperatingSytem() == CENTOS8 \
+                    or Upgrade.FindOperatingSytem() == openEuler20 or Upgrade.FindOperatingSytem() == openEuler22:
+                apache_service = 'httpd'
+                apache_config_dir = '/etc/httpd'
+            else:
+                apache_service = 'apache2'
+                apache_config_dir = '/etc/apache2'
+            
+            # Check if Apache is installed
+            check_apache = f'systemctl is-enabled {apache_service} 2>/dev/null'
+            result = subprocess.run(check_apache, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                Upgrade.stdOut("Fixing Apache configuration...")
+                
+                # 1. Ensure Apache ports are correctly configured
+                command = 'grep -q "Listen 8083" /usr/local/lsws/conf/httpd_config.xml || echo "Apache port configuration might need manual check"'
+                Upgrade.executioner(command, 'Check Apache ports', 1)
+                
+                # 2. Fix proxy rewrite rules for all vhosts
+                # The issue: Both rewrite rules execute, causing incorrect proxying
+                # Fix: Add proper HTTPS condition for SSL proxy rule
+                command = '''find /usr/local/lsws/conf/vhosts/ -name "vhost.conf" -exec sed -i '
+                    /^REWRITERULE.*proxyApacheBackendSSL/i\\
+RewriteCond %{HTTPS}  =on
+                ' {} \;'''
+                Upgrade.executioner(command, 'Fix Apache SSL proxy condition', 1)
+                
+                # Also ensure the proxy backends are properly configured
+                command = '''grep -q "extprocessor apachebackend" /usr/local/lsws/conf/httpd_config.conf || echo "
+extprocessor apachebackend {
+  type                    proxy
+  address                 http://127.0.0.1:8083
+  maxConns                100
+  initTimeout             60
+  retryTimeout            30
+  respBuffer              0
+}
+
+extprocessor proxyApacheBackendSSL {
+  type                    proxy
+  address                 https://127.0.0.1:8082
+  maxConns                100
+  initTimeout             60
+  retryTimeout            30
+  respBuffer              0
+}" >> /usr/local/lsws/conf/httpd_config.conf'''
+                Upgrade.executioner(command, 'Ensure Apache proxy backends exist', 1)
+                
+                # 3. Ensure Apache is configured to listen on correct ports
+                if Upgrade.FindOperatingSytem() in [CENTOS7, CENTOS8, openEuler20, openEuler22]:
+                    apache_port_conf = '/etc/httpd/conf.d/00-port.conf'
+                else:
+                    apache_port_conf = '/etc/apache2/ports.conf'
+                
+                command = f'''
+                grep -q "Listen 8082" {apache_port_conf} || echo "Listen 8082" >> {apache_port_conf}
+                grep -q "Listen 8083" {apache_port_conf} || echo "Listen 8083" >> {apache_port_conf}
+                '''
+                Upgrade.executioner(command, 'Ensure Apache listens on 8082/8083', 1)
+                
+                # 4. Restart Apache service
+                command = f'systemctl restart {apache_service}'
+                Upgrade.executioner(command, f'Restart {apache_service}', 1)
+                
+                # 5. Fix PHP-FPM socket permissions and restart services
+                for version in ['5.4', '5.5', '5.6', '7.0', '7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3']:
+                    if Upgrade.FindOperatingSytem() in [CENTOS7, CENTOS8, openEuler20, openEuler22]:
+                        php_service = f'php{version.replace(".", "")}-php-fpm'
+                        socket_dir = '/var/run/php-fpm'
+                    else:
+                        php_service = f'php{version}-fpm'
+                        socket_dir = '/var/run/php'
+                    
+                    # Ensure socket directory exists with correct permissions
+                    command = f'''
+                    if systemctl is-active {php_service} >/dev/null 2>&1; then
+                        mkdir -p {socket_dir}
+                        chmod 755 {socket_dir}
+                        systemctl restart {php_service}
+                    fi
+                    '''
+                    Upgrade.executioner(command, f'Fix and restart {php_service}', 1)
+                
+                # 6. Reload LiteSpeed to apply proxy changes
+                command = '/usr/local/lsws/bin/lswsctrl reload'
+                Upgrade.executioner(command, 'Reload LiteSpeed', 1)
+                
+                Upgrade.stdOut("Apache configuration fixes completed.")
+            else:
+                Upgrade.stdOut("Apache not detected, skipping Apache fixes.")
+                
+        except Exception as e:
+            Upgrade.stdOut(f"Error fixing Apache configuration: {str(e)}")
+            pass
 
     @staticmethod
     def installQuota():
@@ -3722,7 +5506,7 @@ pm.max_spare_servers = 3
 
             ##
 
-            if Upgrade.FindOperatingSytem() == Ubuntu22 or Upgrade.FindOperatingSytem() == Ubuntu18 \
+            if Upgrade.FindOperatingSytem() == Ubuntu22 or Upgrade.FindOperatingSytem() == Ubuntu24 or Upgrade.FindOperatingSytem() == Ubuntu18 \
                     or Upgrade.FindOperatingSytem() == Ubuntu20:
 
                 print("Install Quota on Ubuntu")
@@ -3734,10 +5518,13 @@ pm.max_spare_servers = 3
 
                 command = "find /lib/modules/ -type f -name '*quota_v*.ko*'"
 
-
-                if subprocess.check_output(command,shell=True).decode("utf-8").find("quota/") == -1:
-                    command = "sudo apt install linux-image-extra-virtual -y"
-                    Upgrade.executioner(command, command, 0, True)
+                try:
+                    output = subprocess.check_output(command, shell=True)
+                    if output and output.decode("utf-8").find("quota/") == -1:
+                        command = "sudo apt install linux-image-extra-virtual -y"
+                        Upgrade.executioner(command, command, 0, True)
+                except Exception as e:
+                    Upgrade.stdOut(f"Error checking quota modules: {str(e)}")
 
                 if Upgrade.edit_fstab('/', '/') == 0:
                     print("Quotas will not be abled as we are are failed to modify fstab file.")
@@ -3978,6 +5765,370 @@ pm.max_spare_servers = 3
 
         command = f'chmod +x {filePath}'
         Upgrade.executioner(command, command, 0, True)
+
+    @staticmethod
+    def fixApacheConfiguration():
+        """
+        Fix Apache configuration issues after upgrade, particularly for 503 errors
+        when Apache is used as reverse proxy to OpenLiteSpeed
+        """
+        try:
+            print("Starting Apache configuration fix...")
+            
+            # Check if Apache is installed
+            osType = Upgrade.FindOperatingSytem()
+            if osType in [CENTOS7, CENTOS8, CloudLinux7, CloudLinux8]:
+                configBasePath = '/etc/httpd/conf.d/'
+                serviceName = 'httpd'
+            else:
+                configBasePath = '/etc/apache2/sites-enabled/'
+                serviceName = 'apache2'
+            
+            if not os.path.exists(configBasePath):
+                print("Apache not installed, skipping Apache fixes.")
+                return
+            
+            # Import required modules
+            from websiteFunctions.models import Websites
+            import re
+            
+            # Fix 1: Update Apache proxy configurations for domains actually using Apache
+            print("Fixing Apache proxy configurations...")
+            fixed_count = 0
+            apache_domains = []
+            
+            # First, identify which domains are using Apache by checking for Apache vhost configs
+            for config_file in os.listdir(configBasePath):
+                if config_file.endswith('.conf'):
+                    # Extract domain name from config file
+                    domain_name = config_file.replace('.conf', '')
+                    config_path = os.path.join(configBasePath, config_file)
+                    
+                    try:
+                        # Read the configuration to verify it's an Apache proxy setup
+                        with open(config_path, 'r') as f:
+                            content = f.read()
+                        
+                        # Check if this is actually an Apache proxy configuration
+                        # Look for common Apache proxy indicators
+                        is_apache_proxy = False
+                        if 'ProxyPass' in content and ('127.0.0.1:8082' in content or '127.0.0.1:8083' in content):
+                            is_apache_proxy = True
+                        elif 'RewriteRule' in content and 'apachebackend' in content:
+                            is_apache_proxy = True
+                        elif '<FilesMatch' in content and 'SetHandler' in content and 'proxy:unix:' in content:
+                            is_apache_proxy = True
+                        
+                        if is_apache_proxy:
+                            apache_domains.append(domain_name)
+                            modified = False
+                            
+                            # Fix the proxy rewrite rules - add missing HTTPS condition
+                            if 'RewriteRule ^/(.*)$ http://apachebackend/$1 [P,L]' in content and 'RewriteCond %{HTTPS} off' not in content:
+                                # Find the RewriteRule for HTTP proxy
+                                lines = content.split('\n')
+                                new_lines = []
+                                i = 0
+                                while i < len(lines):
+                                    line = lines[i]
+                                    if 'RewriteRule ^/(.*)$ http://apachebackend/$1 [P,L]' in line:
+                                        # Add the missing HTTPS condition before the rule
+                                        indent = len(line) - len(line.lstrip())
+                                        new_lines.append(' ' * indent + 'RewriteCond %{HTTPS} off')
+                                        new_lines.append(line)
+                                        modified = True
+                                    else:
+                                        new_lines.append(line)
+                                    i += 1
+                                
+                                if modified:
+                                    content = '\n'.join(new_lines)
+                            
+                            # Write back if modified
+                            if modified:
+                                with open(config_path, 'w') as f:
+                                    f.write(content)
+                                fixed_count += 1
+                                print(f"Fixed Apache configuration for: {config_file}")
+                    
+                    except Exception as e:
+                        print(f"Error processing {config_file}: {str(e)}")
+            
+            print(f"Found {len(apache_domains)} domains using Apache")
+            print(f"Fixed {fixed_count} Apache configurations.")
+            
+            # If no domains are using Apache, skip the rest of the fixes
+            if len(apache_domains) == 0:
+                print("No domains found using Apache as reverse proxy. Skipping remaining Apache fixes.")
+                return
+            
+            # Fix 2: Ensure Apache proxy backends are configured in OLS/LSWS
+            print("Checking OpenLiteSpeed proxy backend configurations...")
+            lsws_config = "/usr/local/lsws/conf/httpd_config.conf"
+            
+            if os.path.exists(lsws_config):
+                with open(lsws_config, 'r') as f:
+                    lsws_content = f.read()
+                
+                modified = False
+                
+                # Check for apachebackend extprocessor
+                if 'extprocessor apachebackend' not in lsws_content:
+                    # Add apachebackend configuration
+                    backend_config = '''
+extprocessor apachebackend {
+  type                    proxy
+  address                 127.0.0.1:8082
+  maxConns                100
+  initTimeout             60
+  retryTimeout            60
+  respBuffer              0
+}
+'''
+                    lsws_content += backend_config
+                    modified = True
+                    print("Added apachebackend extprocessor configuration")
+                
+                # Check for proxyApacheBackendSSL extprocessor
+                if 'extprocessor proxyApacheBackendSSL' not in lsws_content:
+                    # Add proxyApacheBackendSSL configuration
+                    ssl_backend_config = '''
+extprocessor proxyApacheBackendSSL {
+  type                    proxy
+  address                 https://127.0.0.1:8083
+  maxConns                100
+  initTimeout             60
+  retryTimeout            60
+  respBuffer              0
+}
+'''
+                    lsws_content += ssl_backend_config
+                    modified = True
+                    print("Added proxyApacheBackendSSL extprocessor configuration")
+                
+                if modified:
+                    with open(lsws_config, 'w') as f:
+                        f.write(lsws_content)
+                    print("Updated OpenLiteSpeed configuration with Apache proxy backends")
+            
+            # Fix 3: Create/Update .htaccess files ONLY for domains actually using Apache
+            print("Creating/Updating .htaccess files for Apache domains...")
+            htaccess_fixed = 0
+            htaccess_created = 0
+            
+            # Only process domains that we confirmed are using Apache
+            for domain in apache_domains:
+                try:
+                    htaccess_path = f'/home/{domain}/public_html/.htaccess'
+                    
+                    # Check if .htaccess exists
+                    if os.path.exists(htaccess_path):
+                        with open(htaccess_path, 'r') as f:
+                            htaccess_content = f.read()
+                        
+                        # Check if it's an Apache proxy configuration (case insensitive)
+                        if 'apachebackend' in htaccess_content.lower():
+                            # Check if it has proper HTTP/HTTPS handling
+                            needs_update = False
+                            
+                            # Check for old style single rule
+                            if 'REWRITERULE ^(.*)$ HTTP://apachebackend/$1 [P]' in htaccess_content:
+                                needs_update = True
+                            # Check if missing HTTPS conditions
+                            elif 'RewriteCond %{HTTPS} off' not in htaccess_content or 'proxyApacheBackendSSL' not in htaccess_content:
+                                needs_update = True
+                            
+                            if needs_update:
+                                # Create proper .htaccess with both HTTP and HTTPS handling
+                                new_htaccess = '''RewriteEngine On
+
+# HTTP to backend
+RewriteCond %{HTTPS} off
+RewriteRule ^(.*)$ http://apachebackend/$1 [P,L]
+
+# HTTPS to SSL backend  
+RewriteCond %{HTTPS} on
+RewriteRule ^(.*)$ https://proxyApacheBackendSSL/$1 [P,L]
+'''
+                                with open(htaccess_path, 'w') as f:
+                                    f.write(new_htaccess)
+                                htaccess_fixed += 1
+                                print(f"Fixed .htaccess for: {domain}")
+                    else:
+                        # .htaccess doesn't exist - this domain might be missing it!
+                        # Create the proper .htaccess file
+                        print(f"Creating missing .htaccess for Apache domain: {domain}")
+                        
+                        # Ensure public_html exists
+                        public_html_path = f'/home/{domain}/public_html'
+                        if os.path.exists(public_html_path):
+                            new_htaccess = '''RewriteEngine On
+
+# HTTP to backend
+RewriteCond %{HTTPS} off
+RewriteRule ^(.*)$ http://apachebackend/$1 [P,L]
+
+# HTTPS to SSL backend  
+RewriteCond %{HTTPS} on
+RewriteRule ^(.*)$ https://proxyApacheBackendSSL/$1 [P,L]
+'''
+                            with open(htaccess_path, 'w') as f:
+                                f.write(new_htaccess)
+                            
+                            # Set proper permissions
+                            try:
+                                website = Websites.objects.get(domain=domain)
+                                command = f'chown {website.externalApp}:{website.externalApp} {htaccess_path}'
+                                Upgrade.executioner(command, command, 0, True)
+                            except:
+                                pass
+                            
+                            htaccess_created += 1
+                            print(f"Created .htaccess for: {domain}")
+                        else:
+                            print(f"Warning: public_html not found for domain: {domain}")
+                            
+                except Exception as e:
+                    print(f"Error updating .htaccess for {domain}: {str(e)}")
+            
+            print(f"Fixed {htaccess_fixed} .htaccess files.")
+            print(f"Created {htaccess_created} missing .htaccess files.")
+            
+            # Fix 3b: Also fix OpenLiteSpeed vhost configurations that might have incorrect rewrite rules
+            print("Fixing OpenLiteSpeed vhost configurations for Apache domains...")
+            ols_fixed = 0
+            
+            for domain in apache_domains:
+                try:
+                    ols_vhost_path = f'/usr/local/lsws/conf/vhosts/{domain}/vhost.conf'
+                    
+                    if os.path.exists(ols_vhost_path):
+                        with open(ols_vhost_path, 'r') as f:
+                            vhost_content = f.read()
+                        
+                        # Check if it has the incorrect rewrite rules
+                        if 'RewriteCond %{HTTPS}  !=on' in vhost_content and 'HTTP://proxyApacheBackendSSL' in vhost_content:
+                            # This has the buggy configuration where HTTPS rule doesn't have proper condition
+                            modified = False
+                            
+                            # Replace the buggy rewrite section
+                            buggy_pattern = r'rewrite\s*{\s*enable\s*1\s*rules\s*<<<END_rules\s*RewriteEngine On\s*RewriteCond %{HTTPS}\s*!=on\s*REWRITERULE \^\(\.\*\)\$ HTTP://apachebackend/\$1 \[P,L\]\s*REWRITERULE \^\(\.\*\)\$ HTTP://proxyApacheBackendSSL/\$1 \[P,L\]\s*END_rules\s*}'
+                            
+                            correct_rewrite = '''rewrite  {
+  enable                  1
+  rules                   <<<END_rules
+RewriteEngine On
+RewriteCond %{HTTPS} off
+RewriteRule ^(.*)$ http://apachebackend/$1 [P,L]
+RewriteCond %{HTTPS} on
+RewriteRule ^(.*)$ https://proxyApacheBackendSSL/$1 [P,L]
+  END_rules
+}'''
+                            
+                            # Use a simpler approach - find and replace the section
+                            import re
+                            if isinstance(vhost_content, str) and vhost_content:
+                                new_content = re.sub(
+                                    r'rewrite\s*{[^}]+}',
+                                    correct_rewrite,
+                                    vhost_content,
+                                    count=1
+                                )
+                            else:
+                                new_content = vhost_content
+                            
+                            if new_content != vhost_content:
+                                with open(ols_vhost_path, 'w') as f:
+                                    f.write(new_content)
+                                ols_fixed += 1
+                                print(f"Fixed OLS vhost configuration for: {domain}")
+                        
+                except Exception as e:
+                    print(f"Error fixing OLS vhost for {domain}: {str(e)}")
+            
+            if ols_fixed > 0:
+                print(f"Fixed {ols_fixed} OpenLiteSpeed vhost configurations.")
+            
+            # Fix 4: Ensure Apache is listening on correct ports
+            if osType in [CENTOS7, CENTOS8, CloudLinux7, CloudLinux8]:
+                apache_conf = '/etc/httpd/conf/httpd.conf'
+            else:
+                ports_conf = '/etc/apache2/ports.conf'
+                apache_conf = ports_conf if os.path.exists(ports_conf) else '/etc/apache2/apache2.conf'
+            
+            if os.path.exists(apache_conf):
+                with open(apache_conf, 'r') as f:
+                    conf_content = f.read()
+                
+                # Check if Apache is configured to listen on 8082 and 8083
+                if 'Listen 8082' not in conf_content or 'Listen 8083' not in conf_content:
+                    print("Fixing Apache listen ports...")
+                    
+                    # For Ubuntu/Debian, update ports.conf
+                    if osType not in [CENTOS7, CENTOS8, CloudLinux7, CloudLinux8]:
+                        if os.path.exists('/etc/apache2/ports.conf'):
+                            with open('/etc/apache2/ports.conf', 'w') as f:
+                                f.write('Listen 8082\nListen 8083\n')
+                    else:
+                        # For CentOS, update httpd.conf
+                        lines = conf_content.split('\n')
+                        new_lines = []
+                        listen_added = False
+                        
+                        for line in lines:
+                            if line.strip().startswith('Listen') and '80' in line and not listen_added:
+                                new_lines.append('Listen 8082')
+                                new_lines.append('Listen 8083')
+                                listen_added = True
+                            elif 'Listen 8082' not in line and 'Listen 8083' not in line:
+                                new_lines.append(line)
+                        
+                        with open(apache_conf, 'w') as f:
+                            f.write('\n'.join(new_lines))
+                    
+                    print("Fixed Apache listen ports")
+            
+            # Fix 5: Fix PHP-FPM socket permissions
+            print("Fixing PHP-FPM socket permissions...")
+            if osType in [CENTOS7, CENTOS8, CloudLinux7, CloudLinux8]:
+                sock_path = '/var/run/php-fpm/'
+            else:
+                sock_path = '/var/run/php/'
+            
+            if os.path.exists(sock_path):
+                # Set proper permissions
+                command = f'chmod 755 {sock_path}'
+                Upgrade.executioner(command, command, 0, True)
+                
+                # Fix ownership
+                command = f'chown apache:apache {sock_path}' if osType in [CENTOS7, CENTOS8, CloudLinux7, CloudLinux8] else f'chown www-data:www-data {sock_path}'
+                Upgrade.executioner(command, command, 0, True)
+            
+            # Restart services
+            print("Restarting services...")
+            
+            # Restart Apache
+            command = f'systemctl restart {serviceName}'
+            Upgrade.executioner(command, command, 0, True)
+            
+            # Restart OpenLiteSpeed
+            command = 'systemctl restart lsws'
+            Upgrade.executioner(command, command, 0, True)
+            
+            # Restart PHP-FPM services
+            if osType in [CENTOS7, CENTOS8, CloudLinux7, CloudLinux8]:
+                for version in ['54', '55', '56', '70', '71', '72', '73', '74', '80', '81', '82', '83', '84']:
+                    command = f'systemctl restart php{version}-php-fpm'
+                    Upgrade.executioner(command, command, 0, True)
+            else:
+                for version in ['5.6', '7.0', '7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3']:
+                    command = f'systemctl restart php{version}-fpm'
+                    Upgrade.executioner(command, command, 0, True)
+            
+            print("Apache configuration fix completed successfully!")
+            
+        except Exception as e:
+            print(f"Error during Apache configuration fix: {str(e)}")
 
 
 

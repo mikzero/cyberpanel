@@ -20,7 +20,7 @@ class PHPManager:
         # elif distro == ProcessUtilities.ubuntu20:
         #     return ['PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1']
         # else:
-        #     return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1']
+        #     return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1', 'PHP 8.2', 'PHP 8.3', 'PHP 8.4', 'PHP 8.5']
 
         try:
 
@@ -55,7 +55,7 @@ class PHPManager:
         except BaseException as msg:
             from plogical.CyberCPLogFileWriter import CyberCPLogFileWriter as logging
             logging.writeToFile(f'Error while finding php versions on system: {str(msg)}')
-            return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1']
+            return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1', 'PHP 8.2', 'PHP 8.3', 'PHP 8.4', 'PHP 8.5']
 
     @staticmethod
     def findApachePHPVersions():
@@ -67,7 +67,7 @@ class PHPManager:
         # elif distro == ProcessUtilities.ubuntu20:
         #     return ['PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1']
         # else:
-        #     return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1']
+        #     return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1', 'PHP 8.2', 'PHP 8.3', 'PHP 8.4', 'PHP 8.5']
 
         try:
 
@@ -127,7 +127,7 @@ class PHPManager:
         except BaseException as msg:
             from plogical.CyberCPLogFileWriter import CyberCPLogFileWriter as logging
             logging.writeToFile(f'Error while finding php versions on system: {str(msg)}')
-            return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1']
+            return ['PHP 7.0', 'PHP 7.1', 'PHP 7.2', 'PHP 7.3', 'PHP 7.4', 'PHP 8.0', 'PHP 8.1', 'PHP 8.2', 'PHP 8.3', 'PHP 8.4', 'PHP 8.5']
 
     @staticmethod
     def getPHPString(phpVersion):
@@ -253,32 +253,76 @@ class PHPManager:
 
         writeToFile = open(tempStatusPath, 'w')
 
+        # Track which directives we've found and replaced
+        found_directives = {
+            'allow_url_fopen': False,
+            'display_errors': False,
+            'file_uploads': False,
+            'allow_url_include': False,
+            'memory_limit': False,
+            'max_execution_time': False,
+            'upload_max_filesize': False,
+            'max_input_time': False,
+            'post_max_size': False
+        }
+
         for items in data:
             if items.find("allow_url_fopen") > -1 and items.find("=") > -1:
                 writeToFile.writelines(allow_url_fopen + "\n")
+                found_directives['allow_url_fopen'] = True
             elif items.find("display_errors") > -1 and items.find("=") > -1:
                 writeToFile.writelines(display_errors + "\n")
+                found_directives['display_errors'] = True
             elif items.find("file_uploads") > -1 and items.find("=") > -1 and not items.find(
                     "max_file_uploads") > -1:
                 writeToFile.writelines(file_uploads + "\n")
+                found_directives['file_uploads'] = True
             elif items.find("allow_url_include") > -1 and items.find("=") > -1:
                 writeToFile.writelines(allow_url_include + "\n")
-
+                found_directives['allow_url_include'] = True
             elif items.find("memory_limit") > -1 and items.find("=") > -1:
                 writeToFile.writelines("memory_limit = " + memory_limit + "\n")
-
+                found_directives['memory_limit'] = True
             elif items.find("max_execution_time") > -1 and items.find("=") > -1:
                 writeToFile.writelines("max_execution_time = " + max_execution_time + "\n")
-
+                found_directives['max_execution_time'] = True
             elif items.find("upload_max_filesize") > -1 and items.find("=") > -1:
                 writeToFile.writelines("upload_max_filesize = " + upload_max_filesize + "\n")
-
+                found_directives['upload_max_filesize'] = True
             elif items.find("max_input_time") > -1 and items.find("=") > -1:
                 writeToFile.writelines("max_input_time = " + max_input_time + "\n")
+                found_directives['max_input_time'] = True
             elif items.find("post_max_size") > -1 and items.find("=") > -1:
                 writeToFile.writelines("post_max_size = " + post_max_size + "\n")
+                found_directives['post_max_size'] = True
             else:
                 writeToFile.writelines(items + '\n')
+
+        # Add any missing directives at the end of the file
+        missing_directives = []
+        if not found_directives['allow_url_fopen']:
+            missing_directives.append(allow_url_fopen)
+        if not found_directives['display_errors']:
+            missing_directives.append(display_errors)
+        if not found_directives['file_uploads']:
+            missing_directives.append(file_uploads)
+        if not found_directives['allow_url_include']:
+            missing_directives.append(allow_url_include)
+        if not found_directives['memory_limit']:
+            missing_directives.append("memory_limit = " + memory_limit)
+        if not found_directives['max_execution_time']:
+            missing_directives.append("max_execution_time = " + max_execution_time)
+        if not found_directives['upload_max_filesize']:
+            missing_directives.append("upload_max_filesize = " + upload_max_filesize)
+        if not found_directives['max_input_time']:
+            missing_directives.append("max_input_time = " + max_input_time)
+        if not found_directives['post_max_size']:
+            missing_directives.append("post_max_size = " + post_max_size)
+
+        if missing_directives:
+            writeToFile.writelines("\n; Added by CyberPanel PHP Config Manager\n")
+            for directive in missing_directives:
+                writeToFile.writelines(directive + "\n")
 
         writeToFile.close()
 

@@ -3,62 +3,137 @@ import subprocess
 import os
 from mysqlUtilities import mysqlUtilities
 import installLog as logging
-import randomPassword
 import errno
 import MySQLdb as mariadb
 import install
 from os.path import exists
 import time
+import install_utils
+import urllib.request
+import re
 
-# distros
-centos = 0
-ubuntu = 1
-cent8 = 2
-openeuler = 3
+# distros - using from install_utils
+centos = install_utils.centos
+ubuntu = install_utils.ubuntu
+cent8 = install_utils.cent8
+openeuler = install_utils.openeuler
 
 
 def get_Ubuntu_release():
-    release = -1
-    if exists("/etc/lsb-release"):
-        distro_file = "/etc/lsb-release"
-        with open(distro_file) as f:
-            for line in f:
-                if line[:16] == "DISTRIB_RELEASE=":
-                    release = float(line[16:])
+    return install_utils.get_Ubuntu_release(use_print=True, exit_on_error=True)
 
-        if release == -1:
-            print("Can't find distro release name in " + distro_file + " - fatal error")
 
+def get_Ubuntu_code_name():
+    """Get Ubuntu codename based on version"""
+    release = get_Ubuntu_release()
+    if release >= 24.04:
+        return "noble"
+    elif release >= 22.04:
+        return "jammy"
+    elif release >= 20.04:
+        return "focal"
+    elif release >= 18.04:
+        return "bionic"
     else:
-        logging.InstallLog.writeToFile("Can't find linux release file - fatal error")
-        print("Can't find linux release file - fatal error")
-        os._exit(os.EX_UNAVAILABLE)
-
-    return release
+        return "xenial"
 
 
-def FetchCloudLinuxAlmaVersionVersion():
-    if os.path.exists('/etc/os-release'):
-        data = open('/etc/os-release', 'r').read()
-        if (data.find('CloudLinux') > -1 or data.find('cloudlinux') > -1) and (data.find('8.9') > -1 or data.find('Anatoly Levchenko') > -1 or data.find('VERSION="8.') > -1):
-            return 'cl-89'
-        elif (data.find('CloudLinux') > -1 or data.find('cloudlinux') > -1) and (data.find('8.8') > -1 or data.find('Anatoly Filipchenko') > -1):
-            return 'cl-88'
-        elif (data.find('CloudLinux') > -1 or data.find('cloudlinux') > -1) and (data.find('9.4') > -1 or data.find('VERSION="9.') > -1):
-            return 'cl-88'
-        elif (data.find('AlmaLinux') > -1 or data.find('almalinux') > -1) and (data.find('8.9') > -1 or data.find('Midnight Oncilla') > -1 or data.find('VERSION="8.') > -1):
-            return 'al-88'
-        elif (data.find('AlmaLinux') > -1 or data.find('almalinux') > -1) and (data.find('8.7') > -1 or data.find('Stone Smilodon') > -1):
-            return 'al-87'
-        elif (data.find('AlmaLinux') > -1 or data.find('almalinux') > -1) and (data.find('9.4') > -1 or data.find('9.3') > -1 or data.find('Shamrock Pampas') > -1 or data.find('Seafoam Ocelot') > -1 or data.find('VERSION="9.') > -1):
-            return 'al-93'
-    else:
-        return -1
+# Using shared function from install_utils
+FetchCloudLinuxAlmaVersionVersion = install_utils.FetchCloudLinuxAlmaVersionVersion
 
 class InstallCyberPanel:
     mysql_Root_password = ""
     mysqlPassword = ""
     CloudLinux8 = 0
+
+    def install_package(self, package_name, options=""):
+        """Unified package installation across distributions"""
+        command, shell = install_utils.get_package_install_command(self.distro, package_name, options)
+        
+        # InstallCyberPanel always uses verbose mode (no silent option)
+        if self.distro == ubuntu:
+            return install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, shell)
+        else:
+            # For non-Ubuntu, original code didn't pass shell parameter
+            return install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+
+    def manage_service(self, service_name, action="start"):
+        """Unified service management"""
+        service_map = {
+            'mariadb': 'mariadb',
+            'pureftpd': 'pure-ftpd-mysql' if self.distro == ubuntu else 'pure-ftpd',
+            'pdns': 'pdns'
+        }
+        
+        actual_service = service_map.get(service_name, service_name)
+        
+        # For AlmaLinux 9, try both mariadb and mysqld services
+        if service_name == 'mariadb' and (self.distro == cent8 or self.distro == openeuler):
+            # Try mariadb first, then mysqld if mariadb fails
+            command = f'systemctl {action} {actual_service}'
+            result = install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+            if result != 0:
+                # If mariadb service fails, try mysqld
+                command = f'systemctl {action} mysqld'
+                return install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            return result
+        else:
+            command = f'systemctl {action} {actual_service}'
+            return install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+
+    def modify_file_content(self, file_path, replacements):
+        """Generic file content modification"""
+        try:
+            with open(file_path, 'r') as f:
+                data = f.readlines()
+            
+            with open(file_path, 'w') as f:
+                for line in data:
+                    modified_line = line
+                    for old, new in replacements.items():
+                        if old in line:
+                            modified_line = line.replace(old, new)
+                            break
+                    f.write(modified_line)
+            return True
+        except IOError as e:
+            logging.InstallLog.writeToFile(f'[ERROR] {str(e)} [modify_file_content]')
+            return False
+
+    def copy_config_file(self, source_dir, dest_path, mysql_mode='One'):
+        """Handle configuration file copying with mode selection"""
+        # For directories like 'dns' vs 'dns-one', 'pure-ftpd' vs 'pure-ftpd-one'
+        # Default mode is 'One' which uses the -one directories
+        if mysql_mode == 'Two':
+            source_path = source_dir
+        else:
+            # Default mode 'One' uses directories with -one suffix
+            source_path = f"{source_dir}-one"
+        
+        # Ensure we're working with absolute paths
+        if not os.path.isabs(source_path):
+            source_path = os.path.join(self.cwd, source_path)
+        
+        # Determine the actual file to copy
+        if os.path.isdir(source_path):
+            # If dest_path is a file (like pdns.conf), copy the specific file
+            if dest_path.endswith('.conf'):
+                # Look for the specific config file
+                source_file = os.path.join(source_path, os.path.basename(dest_path))
+                if os.path.exists(source_file):
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                    shutil.copy(source_file, dest_path)
+                else:
+                    raise IOError(f"Source file {source_file} not found")
+            else:
+                # If it's a directory, copy the whole directory
+                if os.path.exists(dest_path):
+                    if os.path.isdir(dest_path):
+                        shutil.rmtree(dest_path)
+                shutil.copytree(source_path, dest_path)
+        else:
+            raise IOError(f"Source path {source_path} not found")
 
     @staticmethod
     def ISARM():
@@ -109,71 +184,396 @@ class InstallCyberPanel:
 
     @staticmethod
     def stdOut(message, log=0, exit=0, code=os.EX_OK):
-        install.preFlightsChecks.stdOut(message, log, exit, code)
+        install_utils.stdOut(message, log, exit, code)
+
+    @staticmethod
+    def getLatestLSWSVersion():
+        """Fetch the latest LSWS Enterprise version from LiteSpeed's website"""
+        try:
+            # Try to fetch from the download page
+            url = "https://www.litespeedtech.com/products/litespeed-web-server/download"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                html = response.read().decode('utf-8')
+
+            # Look for the latest version pattern: lsws-X.Y.Z-ent
+            version_pattern = r'lsws-(\d+\.\d+\.\d+)-ent'
+            versions = re.findall(version_pattern, html)
+
+            if versions:
+                # Get the latest version
+                latest_version = sorted(versions, key=lambda v: [int(x) for x in v.split('.')])[-1]
+                InstallCyberPanel.stdOut(f"Found latest LSWS Enterprise version: {latest_version}", 1)
+                return latest_version
+            else:
+                InstallCyberPanel.stdOut("Could not find version pattern in HTML, using fallback", 1)
+
+        except Exception as e:
+            InstallCyberPanel.stdOut(f"Failed to fetch latest LSWS version: {str(e)}, using fallback", 1)
+
+        # Fallback to known latest version
+        return "6.3.4"
+
+    def detectArchitecture(self):
+        """Detect system architecture - custom binaries only for x86_64"""
+        try:
+            import platform
+            arch = platform.machine()
+            return arch == "x86_64"
+        except Exception as msg:
+            logging.InstallLog.writeToFile(str(msg) + " [detectArchitecture]")
+            return False
+
+    def detectPlatform(self):
+        """Detect OS platform for binary selection (rhel8, rhel9, ubuntu)"""
+        try:
+            # Check for Ubuntu
+            if os.path.exists('/etc/lsb-release'):
+                with open('/etc/lsb-release', 'r') as f:
+                    content = f.read()
+                    if 'Ubuntu' in content or 'ubuntu' in content:
+                        return 'ubuntu'
+
+            # Check for RHEL-based distributions
+            if os.path.exists('/etc/os-release'):
+                with open('/etc/os-release', 'r') as f:
+                    content = f.read().lower()
+
+                    # Check for version 8.x (RHEL, AlmaLinux, Rocky, CloudLinux, CentOS 8)
+                    if 'version="8.' in content or 'version_id="8.' in content:
+                        if any(distro in content for distro in ['red hat', 'almalinux', 'rocky', 'cloudlinux', 'centos']):
+                            return 'rhel8'
+
+                    # Check for version 9.x
+                    if 'version="9.' in content or 'version_id="9.' in content:
+                        if any(distro in content for distro in ['red hat', 'almalinux', 'rocky', 'cloudlinux', 'centos']):
+                            return 'rhel9'
+
+            # Default to rhel9 if can't detect (safer default for newer systems)
+            InstallCyberPanel.stdOut("WARNING: Could not detect platform, defaulting to rhel9", 1)
+            return 'rhel9'
+
+        except Exception as msg:
+            logging.InstallLog.writeToFile(str(msg) + " [detectPlatform]")
+            InstallCyberPanel.stdOut(f"ERROR detecting platform: {msg}, defaulting to rhel9", 1)
+            return 'rhel9'
+
+    def downloadCustomBinary(self, url, destination, expected_sha256=None):
+        """Download custom binary file with optional checksum verification"""
+        try:
+            InstallCyberPanel.stdOut(f"Downloading {os.path.basename(destination)}...", 1)
+
+            # Use wget for better progress display
+            command = f'wget -q --show-progress {url} -O {destination}'
+            install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+
+            # Check if file was downloaded successfully by verifying it exists and has reasonable size
+            if os.path.exists(destination):
+                file_size = os.path.getsize(destination)
+                # Verify file size is reasonable (at least 10KB to avoid error pages/empty files)
+                if file_size > 10240:  # 10KB
+                    if file_size > 1048576:  # 1MB
+                        InstallCyberPanel.stdOut(f"Downloaded successfully ({file_size / (1024*1024):.2f} MB)", 1)
+                    else:
+                        InstallCyberPanel.stdOut(f"Downloaded successfully ({file_size / 1024:.2f} KB)", 1)
+
+                    # Verify checksum if provided
+                    if expected_sha256:
+                        InstallCyberPanel.stdOut("Verifying checksum...", 1)
+                        import hashlib
+                        sha256_hash = hashlib.sha256()
+                        with open(destination, "rb") as f:
+                            for byte_block in iter(lambda: f.read(4096), b""):
+                                sha256_hash.update(byte_block)
+                        actual_sha256 = sha256_hash.hexdigest()
+
+                        if actual_sha256 == expected_sha256:
+                            InstallCyberPanel.stdOut("Checksum verified successfully", 1)
+                            return True
+                        else:
+                            InstallCyberPanel.stdOut(f"ERROR: Checksum mismatch!", 1)
+                            InstallCyberPanel.stdOut(f"Expected: {expected_sha256}", 1)
+                            InstallCyberPanel.stdOut(f"Got:      {actual_sha256}", 1)
+                            return False
+                    else:
+                        return True
+                else:
+                    InstallCyberPanel.stdOut(f"ERROR: Downloaded file too small ({file_size} bytes)", 1)
+                    return False
+            else:
+                InstallCyberPanel.stdOut("ERROR: Download failed - file not found", 1)
+                return False
+
+        except Exception as msg:
+            logging.InstallLog.writeToFile(str(msg) + " [downloadCustomBinary]")
+            InstallCyberPanel.stdOut(f"ERROR: {msg}", 1)
+            return False
+
+    def installCustomOLSBinaries(self):
+        """Install custom OpenLiteSpeed binaries with PHP config support"""
+        try:
+            InstallCyberPanel.stdOut("Installing Custom OpenLiteSpeed Binaries", 1)
+            InstallCyberPanel.stdOut("=" * 50, 1)
+
+            # Check architecture
+            if not self.detectArchitecture():
+                InstallCyberPanel.stdOut("WARNING: Custom binaries only available for x86_64", 1)
+                InstallCyberPanel.stdOut("Skipping custom binary installation", 1)
+                InstallCyberPanel.stdOut("Standard OLS will be used", 1)
+                return True  # Not a failure, just skip
+
+            # Detect platform
+            platform = self.detectPlatform()
+            InstallCyberPanel.stdOut(f"Detected platform: {platform}", 1)
+
+            # Platform-specific URLs and checksums (OpenLiteSpeed v2.4.4 — all features config-driven, static linking)
+            # Includes: PHPConfig API, Origin Header Forwarding, ReadApacheConf (with Portmap), Auto-SSL (ACME v2), ModSecurity ABI Compatibility
+            # Module rebuilt 2026-03-04: fix SIGSEGV crash in apply_headers() on error responses (4xx/5xx)
+            BINARY_CONFIGS = {
+                'rhel8': {
+                    'url': 'https://cyberpanel.net/openlitespeed-2.4.4-x86_64-rhel8',
+                    'sha256': 'd08512da7a77468c09d6161de858db60bcc29aed7ce0abf76dca1c72104dc485',
+                    'module_url': 'https://cyberpanel.net/cyberpanel_ols-2.4.4-x86_64-rhel8.so',
+                    'module_sha256': '3fd3bf6e2d50fe2e94e67fcf9f8ee24c4cc31b9edb641bee8c129cb316c3454a'
+                },
+                'rhel9': {
+                    'url': 'https://cyberpanel.net/openlitespeed-2.4.4-x86_64-rhel9',
+                    'sha256': '418d2ea06e29c0f847a2e6cf01f7641d5fb72b65a04e27a8f6b3b54d673cc2df',
+                    'module_url': 'https://cyberpanel.net/cyberpanel_ols-2.4.4-x86_64-rhel9.so',
+                    'module_sha256': '4863fc4c227e50e2d6ec5827aed3e1ad92e9be03a548b7aa1a8a4640853db399'
+                },
+                'ubuntu': {
+                    'url': 'https://cyberpanel.net/openlitespeed-2.4.4-x86_64-ubuntu',
+                    'sha256': '60edf815379c32705540ad4525ea6d07c0390cabca232b6be12376ee538f4b1b',
+                    'module_url': 'https://cyberpanel.net/cyberpanel_ols-2.4.4-x86_64-ubuntu.so',
+                    'module_sha256': '0d7dd17c6e64ac46d4abd5ccb67cc2da51809e24692774e4df76d8f3a6c67e9d'
+                }
+            }
+
+            config = BINARY_CONFIGS.get(platform)
+            if not config:
+                InstallCyberPanel.stdOut(f"ERROR: No binaries available for platform {platform}", 1)
+                InstallCyberPanel.stdOut("Skipping custom binary installation", 1)
+                return True  # Not fatal
+
+            OLS_BINARY_URL = config['url']
+            OLS_BINARY_SHA256 = config['sha256']
+            MODULE_URL = config['module_url']
+            MODULE_SHA256 = config['module_sha256']
+            OLS_BINARY_PATH = "/usr/local/lsws/bin/openlitespeed"
+            MODULE_PATH = "/usr/local/lsws/modules/cyberpanel_ols.so"
+
+            # Create backup
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_dir = f"/usr/local/lsws/backup-{timestamp}"
+
+            try:
+                os.makedirs(backup_dir, exist_ok=True)
+                if os.path.exists(OLS_BINARY_PATH):
+                    shutil.copy2(OLS_BINARY_PATH, f"{backup_dir}/openlitespeed.backup")
+                    InstallCyberPanel.stdOut(f"Backup created at: {backup_dir}", 1)
+            except Exception as e:
+                InstallCyberPanel.stdOut(f"WARNING: Could not create backup: {e}", 1)
+
+            # Download binaries to temp location
+            tmp_binary = "/tmp/openlitespeed-custom"
+            tmp_module = "/tmp/cyberpanel_ols.so"
+
+            InstallCyberPanel.stdOut("Downloading custom binaries...", 1)
+
+            # Download OpenLiteSpeed binary with checksum verification
+            if not self.downloadCustomBinary(OLS_BINARY_URL, tmp_binary, OLS_BINARY_SHA256):
+                InstallCyberPanel.stdOut("ERROR: Failed to download or verify OLS binary", 1)
+                InstallCyberPanel.stdOut("Continuing with standard OLS", 1)
+                return True  # Not fatal, continue with standard OLS
+
+            # Download module with checksum verification (if available)
+            module_downloaded = False
+            if MODULE_URL and MODULE_SHA256:
+                if not self.downloadCustomBinary(MODULE_URL, tmp_module, MODULE_SHA256):
+                    InstallCyberPanel.stdOut("ERROR: Failed to download or verify module", 1)
+                    InstallCyberPanel.stdOut("Continuing with standard OLS", 1)
+                    return True  # Not fatal, continue with standard OLS
+                module_downloaded = True
+            else:
+                InstallCyberPanel.stdOut("Note: No CyberPanel module for this platform", 1)
+
+            # Install OpenLiteSpeed binary
+            InstallCyberPanel.stdOut("Installing custom binaries...", 1)
+
+            try:
+                shutil.move(tmp_binary, OLS_BINARY_PATH)
+                os.chmod(OLS_BINARY_PATH, 0o755)
+                InstallCyberPanel.stdOut("Installed OpenLiteSpeed binary", 1)
+            except Exception as e:
+                InstallCyberPanel.stdOut(f"ERROR: Failed to install binary: {e}", 1)
+                logging.InstallLog.writeToFile(str(e) + " [installCustomOLSBinaries - binary install]")
+                return False
+
+            # Install module (if downloaded)
+            if module_downloaded:
+                try:
+                    os.makedirs(os.path.dirname(MODULE_PATH), exist_ok=True)
+                    shutil.move(tmp_module, MODULE_PATH)
+                    os.chmod(MODULE_PATH, 0o644)
+                    InstallCyberPanel.stdOut("Installed CyberPanel module", 1)
+                except Exception as e:
+                    InstallCyberPanel.stdOut(f"ERROR: Failed to install module: {e}", 1)
+                    logging.InstallLog.writeToFile(str(e) + " [installCustomOLSBinaries - module install]")
+                    return False
+
+            # Verify installation
+            if os.path.exists(OLS_BINARY_PATH):
+                if not module_downloaded or os.path.exists(MODULE_PATH):
+                    InstallCyberPanel.stdOut("=" * 50, 1)
+                    InstallCyberPanel.stdOut("Custom Binaries Installed Successfully", 1)
+                    InstallCyberPanel.stdOut("Features enabled:", 1)
+                    InstallCyberPanel.stdOut("  - Static-linked cross-platform binary", 1)
+                    if module_downloaded:
+                        InstallCyberPanel.stdOut("  - Apache-style .htaccess support", 1)
+                        InstallCyberPanel.stdOut("  - php_value/php_flag directives", 1)
+                        InstallCyberPanel.stdOut("  - Enhanced header control", 1)
+                    InstallCyberPanel.stdOut(f"Backup: {backup_dir}", 1)
+                    InstallCyberPanel.stdOut("=" * 50, 1)
+                    return True
+
+            InstallCyberPanel.stdOut("ERROR: Installation verification failed", 1)
+            return False
+
+        except Exception as msg:
+            logging.InstallLog.writeToFile(str(msg) + " [installCustomOLSBinaries]")
+            InstallCyberPanel.stdOut(f"ERROR: {msg}", 1)
+            InstallCyberPanel.stdOut("Continuing with standard OLS", 1)
+            return True  # Non-fatal error, continue
+
+    def configureCustomModule(self):
+        """Configure CyberPanel module in OpenLiteSpeed config"""
+        try:
+            InstallCyberPanel.stdOut("Configuring CyberPanel module...", 1)
+
+            CONFIG_FILE = "/usr/local/lsws/conf/httpd_config.conf"
+
+            if not os.path.exists(CONFIG_FILE):
+                InstallCyberPanel.stdOut("WARNING: Config file not found", 1)
+                InstallCyberPanel.stdOut("Module will be auto-loaded", 1)
+                return True
+
+            # Check if module is already configured
+            with open(CONFIG_FILE, 'r') as f:
+                content = f.read()
+                if 'cyberpanel_ols' in content:
+                    InstallCyberPanel.stdOut("Module already configured", 1)
+                    return True
+
+            # Add module configuration
+            module_config = """
+module cyberpanel_ols {
+  ls_enabled          1
+}
+"""
+            # Backup config
+            shutil.copy2(CONFIG_FILE, f"{CONFIG_FILE}.backup")
+
+            # Append module config
+            with open(CONFIG_FILE, 'a') as f:
+                f.write(module_config)
+
+            InstallCyberPanel.stdOut("Module configured successfully", 1)
+            return True
+
+        except Exception as msg:
+            logging.InstallLog.writeToFile(str(msg) + " [configureCustomModule]")
+            InstallCyberPanel.stdOut(f"WARNING: Module configuration failed: {msg}", 1)
+            InstallCyberPanel.stdOut("Module may still work via auto-load", 1)
+            return True  # Non-fatal
 
     def installLiteSpeed(self):
         if self.ent == 0:
-            if self.distro == ubuntu:
-                command = "DEBIAN_FRONTEND=noninteractive apt-get -y install openlitespeed"
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
-            elif self.distro == centos:
-                command = 'yum install -y openlitespeed'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
-            else:
-                command = 'dnf install -y openlitespeed'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            # Install standard OpenLiteSpeed package
+            self.install_package('openlitespeed')
+
+            # Install custom binaries with PHP config support
+            # This replaces the standard binary with enhanced version
+            self.installCustomOLSBinaries()
+
+            # Configure the custom module
+            self.configureCustomModule()
+
+            # Enable Auto-SSL in httpd_config.conf
+            try:
+                import re
+                conf_path = '/usr/local/lsws/conf/httpd_config.conf'
+                if os.path.exists(conf_path):
+                    with open(conf_path, 'r') as f:
+                        content = f.read()
+                    if 'autoSSL' not in content:
+                        content = re.sub(
+                            r'(adminEmails\s+\S+)',
+                            r'\1\nautoSSL                   1\nacmeEmail                 admin@cyberpanel.net',
+                            content,
+                            count=1
+                        )
+                        with open(conf_path, 'w') as f:
+                            f.write(content)
+                        InstallCyberPanel.stdOut("Auto-SSL enabled in httpd_config.conf", 1)
+            except Exception as e:
+                InstallCyberPanel.stdOut(f"WARNING: Could not enable Auto-SSL: {e}", 1)
 
         else:
             try:
                 try:
                     command = 'groupadd nobody'
-                    install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+                    install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
                 except:
                     pass
 
                 try:
                     command = 'usermod -a -G nobody nobody'
-                    install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+                    install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
                 except:
                     pass
 
-                if InstallCyberPanel.ISARM():
-                    command = 'wget https://www.litespeedtech.com/packages/6.0/lsws-6.2-ent-aarch64-linux.tar.gz'
-                else:
-                    command = 'wget https://www.litespeedtech.com/packages/6.0/lsws-6.2-ent-x86_64-linux.tar.gz'
-
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                # Get the latest LSWS Enterprise version dynamically
+                lsws_version = InstallCyberPanel.getLatestLSWSVersion()
 
                 if InstallCyberPanel.ISARM():
-                    command = 'tar zxf lsws-6.2-ent-aarch64-linux.tar.gz'
+                    command = f'wget https://www.litespeedtech.com/packages/6.0/lsws-{lsws_version}-ent-aarch64-linux.tar.gz'
                 else:
-                    command = 'tar zxf lsws-6.2-ent-x86_64-linux.tar.gz'
+                    command = f'wget https://www.litespeedtech.com/packages/6.0/lsws-{lsws_version}-ent-x86_64-linux.tar.gz'
 
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+
+                if InstallCyberPanel.ISARM():
+                    command = f'tar zxf lsws-{lsws_version}-ent-aarch64-linux.tar.gz'
+                else:
+                    command = f'tar zxf lsws-{lsws_version}-ent-x86_64-linux.tar.gz'
+
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 if str.lower(self.serial) == 'trial':
-                    command = 'wget -q --output-document=lsws-6.2/trial.key http://license.litespeedtech.com/reseller/trial.key'
+                    command = f'wget -q --output-document=lsws-{lsws_version}/trial.key http://license.litespeedtech.com/reseller/trial.key'
                 if self.serial == '1111-2222-3333-4444':
-                    command = 'wget -q --output-document=/root/cyberpanel/install/lsws-6.2/trial.key http://license.litespeedtech.com/reseller/trial.key'
-                    install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                    command = f'wget -q --output-document=/root/cyberpanel/install/lsws-{lsws_version}/trial.key http://license.litespeedtech.com/reseller/trial.key'
+                    install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
                 else:
-                    writeSerial = open('lsws-6.2/serial.no', 'w')
+                    writeSerial = open(f'lsws-{lsws_version}/serial.no', 'w')
                     writeSerial.writelines(self.serial)
                     writeSerial.close()
 
-                shutil.copy('litespeed/install.sh', 'lsws-6.2/')
-                shutil.copy('litespeed/functions.sh', 'lsws-6.2/')
+                shutil.copy('litespeed/install.sh', f'lsws-{lsws_version}/')
+                shutil.copy('litespeed/functions.sh', f'lsws-{lsws_version}/')
 
-                os.chdir('lsws-6.2')
+                os.chdir(f'lsws-{lsws_version}')
 
                 command = 'chmod +x install.sh'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 command = 'chmod +x functions.sh'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 command = './install.sh'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 os.chdir(self.cwd)
                 confPath = '/usr/local/lsws/conf/'
@@ -182,7 +582,7 @@ class InstallCyberPanel:
                 shutil.copy('litespeed/httpd.conf', confPath)
 
                 command = 'chown -R lsadm:lsadm ' + confPath
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
 
             except BaseException as msg:
                 logging.InstallLog.writeToFile('[ERROR] ' + str(msg) + " [installLiteSpeed]")
@@ -191,8 +591,8 @@ class InstallCyberPanel:
             return 1
 
     def reStartLiteSpeed(self):
-        command = self.server_root_path + "bin/lswsctrl restart"
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+        command = install_utils.format_restart_litespeed_command(self.server_root_path)
+        install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
 
     def fix_ols_configs(self):
         try:
@@ -224,97 +624,198 @@ class InstallCyberPanel:
         try:
             InstallCyberPanel.stdOut("Changing default port to 80..", 1)
 
-            data = open(self.server_root_path + "conf/httpd_config.conf").readlines()
+            file_path = self.server_root_path + "conf/httpd_config.conf"
+            if self.modify_file_content(file_path, {"*:8088": "*:80"}):
+                InstallCyberPanel.stdOut("Default port is now 80 for OpenLiteSpeed!", 1)
+            else:
+                return 0
 
-            writeDataToFile = open(self.server_root_path + "conf/httpd_config.conf", 'w')
-
-            for items in data:
-                if (items.find("*:8088") > -1):
-                    writeDataToFile.writelines(items.replace("*:8088", "*:80"))
-                else:
-                    writeDataToFile.writelines(items)
-
-            writeDataToFile.close()
-
-            InstallCyberPanel.stdOut("Default port is now 80 for OpenLiteSpeed!", 1)
-
-        except IOError as msg:
+        except Exception as msg:
             logging.InstallLog.writeToFile('[ERROR] ' + str(msg) + " [changePortTo80]")
             return 0
 
         return self.reStartLiteSpeed()
 
     def installAllPHPVersions(self):
-
+        php_versions = ['71', '72', '73', '74', '80', '81', '82', '83']
+        
         if self.distro == ubuntu:
+            # Install base PHP 7.x packages
             command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install ' \
                       'lsphp7? lsphp7?-common lsphp7?-curl lsphp7?-dev lsphp7?-imap lsphp7?-intl lsphp7?-json ' \
                       'lsphp7?-ldap lsphp7?-mysql lsphp7?-opcache lsphp7?-pspell lsphp7?-recode ' \
                       'lsphp7?-sqlite3 lsphp7?-tidy'
-
             os.system(command)
-
-            command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp80*'
-            os.system(command)
-
-            command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp81*'
-            os.system(command)
-
-            command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp82*'
-            os.system(command)
-
-            command = 'DEBIAN_FRONTEND=noninteractive apt-get -y install lsphp83*'
-            os.system(command)
-
+            
+            # Install PHP 8.x versions
+            for version in php_versions[4:]:  # 80, 81, 82, 83
+                self.install_package(f'lsphp{version}*')
+                
         elif self.distro == centos:
+            # First install the group
             command = 'yum -y groupinstall lsphp-all'
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            
+            InstallCyberPanel.stdOut("LiteSpeed PHPs successfully installed!", 1)
+            
+            # Install individual PHP versions
+            for version in php_versions:
+                self.install_package(f'lsphp{version}*', '--skip-broken')
+                
+        elif self.distro == cent8:
+            # Install PHP versions in batches with exclusions
+            exclude_flags = "--exclude lsphp73-pecl-zip --exclude *imagick*"
+            
+            # First batch: PHP 7.x and 8.0
+            versions_batch1 = ' '.join([f'lsphp{v}*' for v in php_versions[:5]])
+            self.install_package(versions_batch1, f'{exclude_flags} --skip-broken')
+            
+            # Second batch: PHP 8.1+
+            versions_batch2 = ' '.join([f'lsphp{v}*' for v in php_versions[5:]])
+            self.install_package(versions_batch2, f'{exclude_flags} --skip-broken')
+            
+        elif self.distro == openeuler:
+            # Install all PHP versions at once
+            all_versions = ' '.join([f'lsphp{v}*' for v in php_versions])
+            self.install_package(all_versions)
+            
+        if self.distro != ubuntu:
+            InstallCyberPanel.stdOut("LiteSpeed PHPs successfully installed!", 1)
 
-        InstallCyberPanel.stdOut("LiteSpeed PHPs successfully installed!", 1)
+    def installSieve(self):
+        """Install Sieve (Dovecot Sieve) for email filtering on all OS variants"""
+        try:
+            InstallCyberPanel.stdOut("Installing Sieve (Dovecot Sieve) for email filtering...", 1)
 
-        ## only php 71
-        if self.distro == centos:
-            command = 'yum install -y lsphp71* --skip-broken'
+            if self.distro == ubuntu:
+                # Install dovecot-sieve and dovecot-managesieved
+                self.install_package('dovecot-sieve dovecot-managesieved')
+            else:
+                # For CentOS/AlmaLinux/OpenEuler
+                self.install_package('dovecot-pigeonhole')
 
-            subprocess.call(command, shell=True)
+            # Write ManageSieve config
+            managesieve_conf = '/etc/dovecot/conf.d/20-managesieve.conf'
+            os.makedirs('/etc/dovecot/conf.d', exist_ok=True)
+            with open(managesieve_conf, 'w') as f:
+                f.write("""protocols = $protocols sieve
 
-            ## only php 72
-            command = 'yum install -y lsphp72* --skip-broken'
+service managesieve-login {
+  inet_listener sieve {
+    port = 4190
+  }
+}
 
-            subprocess.call(command, shell=True)
+service managesieve {
+  process_limit = 256
+}
 
-            ## only php 73
-            command = 'yum install -y lsphp73* --skip-broken'
+protocol sieve {
+  managesieve_notify_capability = mailto
+  managesieve_sieve_capability = fileinto reject envelope encoded-character vacation subaddress comparator-i;ascii-numeric relational regex imap4flags copy include variables body enotify environment mailbox date index ihave duplicate mime foreverypart extracttext
+}
+""")
 
-            subprocess.call(command, shell=True)
+            # Add Sieve port 4190 to firewall
+            try:
+                import firewall.core.fw as fw
+                subprocess.call(['firewall-cmd', '--permanent', '--add-port=4190/tcp'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.call(['firewall-cmd', '--reload'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                # firewalld may not be available, try ufw
+                subprocess.call(['ufw', 'allow', '4190/tcp'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            ## only php 74
-            command = 'yum install -y lsphp74* --skip-broken'
+            InstallCyberPanel.stdOut("Sieve successfully installed and configured!", 1)
+            return 1
 
-            subprocess.call(command, shell=True)
+        except BaseException as msg:
+            logging.InstallLog.writeToFile('[ERROR] ' + str(msg) + " [installSieve]")
+            return 0
 
-            command = 'yum install lsphp80* -y --skip-broken'
-            subprocess.call(command, shell=True)
+    @staticmethod
+    def setupWebmail():
+        """Set up Dovecot master user and webmail config for SSO"""
+        try:
+            # Skip if dovecot not installed
+            if not os.path.exists('/etc/dovecot/dovecot.conf'):
+                InstallCyberPanel.stdOut("Dovecot not installed, skipping webmail setup.", 1)
+                return 1
 
-            command = 'yum install lsphp81* -y --skip-broken'
-            subprocess.call(command, shell=True)
+            # Skip if already configured
+            if os.path.exists('/etc/cyberpanel/webmail.conf') and os.path.exists('/etc/dovecot/master-users'):
+                InstallCyberPanel.stdOut("Webmail master user already configured.", 1)
+                return 1
 
-            command = 'yum install lsphp82* -y --skip-broken'
-            subprocess.call(command, shell=True)
+            InstallCyberPanel.stdOut("Setting up webmail master user for SSO...", 1)
 
-            command = 'yum install lsphp83* -y --skip-broken'
-            subprocess.call(command, shell=True)
+            import secrets, string
+            chars = string.ascii_letters + string.digits
+            master_password = ''.join(secrets.choice(chars) for _ in range(32))
 
-        if self.distro == cent8:
-            command = 'dnf install lsphp71* lsphp72* lsphp73* lsphp74* lsphp80* --exclude lsphp73-pecl-zip --exclude *imagick* -y --skip-broken'
-            subprocess.call(command, shell=True)
+            # Hash the password using doveadm
+            result = subprocess.run(
+                ['doveadm', 'pw', '-s', 'SHA512-CRYPT', '-p', master_password],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                logging.InstallLog.writeToFile('[ERROR] doveadm pw failed: ' + result.stderr + " [setupWebmail]")
+                return 0
 
-            command = 'dnf install lsphp81* lsphp82* lsphp83* --exclude *imagick* -y --skip-broken'
-            subprocess.call(command, shell=True)
-        
-        if self.distro == openeuler:
-            command = 'dnf install lsphp71* lsphp72* lsphp73* lsphp74* lsphp80* lsphp81* lsphp82* lsphp83* -y'
-            subprocess.call(command, shell=True)
+            password_hash = result.stdout.strip()
+
+            # Write /etc/dovecot/master-users
+            with open('/etc/dovecot/master-users', 'w') as f:
+                f.write('cyberpanel_master:' + password_hash + '\n')
+            os.chmod('/etc/dovecot/master-users', 0o600)
+            subprocess.call(['chown', 'dovecot:dovecot', '/etc/dovecot/master-users'])
+
+            # Ensure /etc/cyberpanel/ exists
+            os.makedirs('/etc/cyberpanel', exist_ok=True)
+
+            # Write /etc/cyberpanel/webmail.conf
+            import json as json_module
+            webmail_conf = {
+                'master_user': 'cyberpanel_master',
+                'master_password': master_password
+            }
+            with open('/etc/cyberpanel/webmail.conf', 'w') as f:
+                json_module.dump(webmail_conf, f)
+            os.chmod('/etc/cyberpanel/webmail.conf', 0o600)
+            subprocess.call(['chown', 'cyberpanel:cyberpanel', '/etc/cyberpanel/webmail.conf'])
+
+            # Patch dovecot.conf if master passdb block missing
+            dovecot_conf_path = '/etc/dovecot/dovecot.conf'
+            with open(dovecot_conf_path, 'r') as f:
+                dovecot_content = f.read()
+
+            if 'auth_master_user_separator' not in dovecot_content:
+                master_block = """auth_master_user_separator = *
+
+passdb {
+    driver = passwd-file
+    master = yes
+    args = /etc/dovecot/master-users
+    result_success = continue
+}
+
+"""
+                dovecot_content = dovecot_content.replace(
+                    'passdb {',
+                    master_block + 'passdb {',
+                    1
+                )
+                with open(dovecot_conf_path, 'w') as f:
+                    f.write(dovecot_content)
+
+            # Restart Dovecot to pick up changes
+            subprocess.call(['systemctl', 'restart', 'dovecot'])
+
+            InstallCyberPanel.stdOut("Webmail master user setup complete!", 1)
+            return 1
+
+        except BaseException as msg:
+            logging.InstallLog.writeToFile('[ERROR] ' + str(msg) + " [setupWebmail]")
+            return 0
 
     def installMySQL(self, mysql):
 
@@ -322,17 +823,14 @@ class InstallCyberPanel:
 
         if self.distro == ubuntu:
 
-            command = 'DEBIAN_FRONTEND=noninteractive apt-get install software-properties-common -y'
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
-
-            command = "DEBIAN_FRONTEND=noninteractive apt-get install apt-transport-https curl -y"
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+            command = 'DEBIAN_FRONTEND=noninteractive apt-get install software-properties-common apt-transport-https curl -y'
+            install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
             command = "mkdir -p /etc/apt/keyrings"
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
             command = "curl -o /etc/apt/keyrings/mariadb-keyring.pgp 'https://mariadb.org/mariadb_release_signing_key.pgp'"
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
             RepoPath = '/etc/apt/sources.list.d/mariadb.sources'
             RepoContent = f"""
 # MariaDB 10.11 repository list - created 2023-12-11 07:53 UTC
@@ -349,15 +847,42 @@ Signed-By: /etc/apt/keyrings/mariadb-keyring.pgp
 
             if get_Ubuntu_release() > 21.00:
                 command = 'curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version=10.11'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
-            #     WriteToFile = open(RepoPath, 'w')
-            #     WriteToFile.write(RepoContent)
-            #     WriteToFile.close()
+                result = install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR, True)
+                
+                # If the download fails, use manual repo configuration as fallback
+                if result != 1:
+                    install_utils.writeToFile("MariaDB repo setup script failed, using manual configuration...")
+                    
+                    # First, ensure directories exist
+                    command = 'mkdir -p /usr/share/keyrings /etc/apt/sources.list.d'
+                    install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                    
+                    # Download and add MariaDB signing key
+                    command = 'curl -fsSL https://mariadb.org/mariadb_release_signing_key.pgp | gpg --dearmor -o /usr/share/keyrings/mariadb-keyring.pgp'
+                    install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                    
+                    # Use multiple mirror options for better reliability
+                    RepoPath = '/etc/apt/sources.list.d/mariadb.list'
+                    codename = get_Ubuntu_code_name()
+                    RepoContent = f"""# MariaDB 10.11 repository list - manual fallback
+# Primary mirror
+deb [arch=amd64,arm64,ppc64el,s390x signed-by=/usr/share/keyrings/mariadb-keyring.pgp] https://mirror.mariadb.org/repo/10.11/ubuntu {codename} main
+
+# Alternative mirrors (uncomment if primary fails)
+# deb [arch=amd64,arm64,ppc64el,s390x signed-by=/usr/share/keyrings/mariadb-keyring.pgp] https://mirrors.gigenet.com/mariadb/repo/10.11/ubuntu {codename} main
+# deb [arch=amd64,arm64,ppc64el,s390x signed-by=/usr/share/keyrings/mariadb-keyring.pgp] https://ftp.osuosl.org/pub/mariadb/repo/10.11/ubuntu {codename} main
+"""
+                    
+                    WriteToFile = open(RepoPath, 'w')
+                    WriteToFile.write(RepoContent)
+                    WriteToFile.close()
+                    
+                    install_utils.writeToFile("Manual MariaDB repository configuration completed.")
 
 
 
             command = 'DEBIAN_FRONTEND=noninteractive apt-get update -y'
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+            install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
 
             command = "DEBIAN_FRONTEND=noninteractive apt-get install mariadb-server -y"
@@ -387,34 +912,41 @@ gpgcheck=1
             if type == 'cl' and version >= 88:
 
                 command = 'yum remove db-governor db-governor-mysql -y'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
                 command = 'yum install governor-mysql -y'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
                 command = '/usr/share/lve/dbgovernor/mysqlgovernor.py --mysql-version=mariadb106'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
                 command = '/usr/share/lve/dbgovernor/mysqlgovernor.py --install --yes'
 
             else:
 
                 command = 'curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version=10.11'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
                 command = 'yum remove mariadb* -y'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
                 command = 'sudo dnf -qy module disable mariadb'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
                 command = 'sudo dnf module reset mariadb -y'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
+                # Disable problematic mariadb-maxscale repository to avoid 404 errors
+                command = 'dnf config-manager --disable mariadb-maxscale'
+                install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR, True)
+
+                # Clear dnf cache to avoid repository issues
+                command = 'dnf clean all'
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
                 command = 'dnf install MariaDB-server MariaDB-client MariaDB-backup -y'
 
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+        install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
 
         ############## Start mariadb ######################
 
@@ -429,20 +961,23 @@ gpgcheck=1
                 passwordCMD = "use mysql;DROP DATABASE IF EXISTS test;DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%%';GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' IDENTIFIED BY '%s';flush privileges;" % (
                     InstallCyberPanel.mysql_Root_password)
 
-            command = 'mariadb -u root -e "' + passwordCMD + '"'
-
-            install.preFlightsChecks.call(command, self.distro, command, command, 0, 0, os.EX_OSERR)
+            # For AlmaLinux 9, try mysql command first, then mariadb
+            if self.distro == cent8 or self.distro == openeuler:
+                command = 'mysql -u root -e "' + passwordCMD + '"'
+                result = install_utils.call(command, self.distro, command, command, 0, 0, os.EX_OSERR)
+                if result != 0:
+                    # If mysql command fails, try mariadb
+                    command = 'mariadb -u root -e "' + passwordCMD + '"'
+                    install_utils.call(command, self.distro, command, command, 0, 0, os.EX_OSERR)
+            else:
+                command = 'mariadb -u root -e "' + passwordCMD + '"'
+                install_utils.call(command, self.distro, command, command, 0, 0, os.EX_OSERR)
 
     def startMariaDB(self):
 
         if self.remotemysql == 'OFF':
             ############## Start mariadb ######################
-            if self.distro == cent8 or self.distro == ubuntu:
-                command = 'systemctl start mariadb'
-            else:
-                command = "systemctl start mariadb"
-
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            self.manage_service('mariadb', 'start')
 
             ############## Enable mariadb at system startup ######################
 
@@ -451,12 +986,7 @@ gpgcheck=1
             if os.path.exists('/etc/systemd/system/mariadb.service'):
                 os.remove('/etc/systemd/system/mariadb.service')
 
-            if self.distro == ubuntu:
-                command = "systemctl enable mariadb"
-            else:
-                command = "systemctl enable mariadb"
-
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+            self.manage_service('mariadb', 'enable')
 
     def fixMariaDB(self):
         self.stdOut("Setup MariaDB so it can support Cyberpanel's needs")
@@ -483,55 +1013,57 @@ gpgcheck=1
         except IOError as err:
             self.stdOut("[ERROR] Error in setting: " + fileName + ": " + str(err), 1, 1, os.EX_OSERR)
 
-        os.system('systemctl restart mariadb')
+        # Use the manage_service method for consistent service management
+        if self.distro == cent8 or self.distro == openeuler:
+            # Try mariadb first, then mysqld
+            result = os.system('systemctl restart mariadb')
+            if result != 0:
+                os.system('systemctl restart mysqld')
+        else:
+            os.system('systemctl restart mariadb')
 
         self.stdOut("MariaDB is now setup so it can support Cyberpanel's needs")
 
     def installPureFTPD(self):
         if self.distro == ubuntu:
-            command = 'DEBIAN_FRONTEND=noninteractive apt install pure-ftpd-mysql -y'
-            os.system(command)
+            self.install_package('pure-ftpd-mysql')
 
             if get_Ubuntu_release() == 18.10:
-                command = 'wget https://rep.cyberpanel.net/pure-ftpd-common_1.0.47-3_all.deb'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
-
-                command = 'wget https://rep.cyberpanel.net/pure-ftpd-mysql_1.0.47-3_amd64.deb'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
-
-                command = 'dpkg --install --force-confold pure-ftpd-common_1.0.47-3_all.deb'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
-
-                command = 'dpkg --install --force-confold pure-ftpd-mysql_1.0.47-3_amd64.deb'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
-
-        elif self.distro == centos:
-            command = "yum install -y pure-ftpd"
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
-        elif self.distro == cent8 or self.distro == openeuler:
-            command = 'dnf install pure-ftpd -y'
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                # Special handling for Ubuntu 18.10
+                packages = [
+                    ('pure-ftpd-common_1.0.47-3_all.deb', 'wget https://rep.cyberpanel.net/pure-ftpd-common_1.0.47-3_all.deb'),
+                    ('pure-ftpd-mysql_1.0.47-3_amd64.deb', 'wget https://rep.cyberpanel.net/pure-ftpd-mysql_1.0.47-3_amd64.deb')
+                ]
+                
+                for filename, wget_cmd in packages:
+                    install_utils.call(wget_cmd, self.distro, wget_cmd, wget_cmd, 1, 1, os.EX_OSERR)
+                    command = f'dpkg --install --force-confold {filename}'
+                    install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+        else:
+            self.install_package('pure-ftpd')
 
         ####### Install pureftpd to system startup
 
         command = "systemctl enable " + install.preFlightsChecks.pureFTPDServiceName(self.distro)
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+        install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
         ###### FTP Groups and user settings settings
 
         command = 'groupadd -g 2001 ftpgroup'
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+        install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
         command = 'useradd -u 2001 -s /bin/false -d /bin/null -c "pureftpd user" -g ftpgroup ftpuser'
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+        install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
     def startPureFTPD(self):
         ############## Start pureftpd ######################
-        if self.distro == ubuntu:
-            command = 'systemctl start pure-ftpd-mysql'
-        else:
-            command = 'systemctl start pure-ftpd'
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+        serviceName = install.preFlightsChecks.pureFTPDServiceName(self.distro)
+        
+        # During fresh installation, don't start Pure-FTPd yet
+        # It will be started after Django migrations create the required tables
+        InstallCyberPanel.stdOut("Pure-FTPd enabled for startup.", 1)
+        InstallCyberPanel.stdOut("Note: Pure-FTPd will start after database setup is complete.", 1)
+        logging.InstallLog.writeToFile("Pure-FTPd enabled but not started - waiting for Django migrations")
 
     def installPureFTPDConfigurations(self, mysql):
         try:
@@ -540,9 +1072,12 @@ gpgcheck=1
             InstallCyberPanel.stdOut("Configuring PureFTPD..", 1)
 
             try:
-                os.mkdir("/etc/ssl/private")
-            except:
-                logging.InstallLog.writeToFile("[ERROR] Could not create directory for FTP SSL")
+                if not os.path.exists("/etc/ssl/private"):
+                    os.makedirs("/etc/ssl/private", mode=0o755)
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    logging.InstallLog.writeToFile("[ERROR] Could not create directory for FTP SSL: " + str(e))
+                    raise
 
             if (self.distro == centos or self.distro == cent8 or self.distro == openeuler) or (
                     self.distro == ubuntu and get_Ubuntu_release() == 18.14):
@@ -550,22 +1085,12 @@ gpgcheck=1
             else:
                 command = 'openssl req -x509 -nodes -days 7300 -newkey rsa:2048 -subj "/C=US/ST=Denial/L=Sprinal-ield/O=Dis/CN=www.example.com" -keyout /etc/ssl/private/pure-ftpd.pem -out /etc/ssl/private/pure-ftpd.pem'
 
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+            install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
 
             os.chdir(self.cwd)
             ftpdPath = "/etc/pure-ftpd"
 
-            if os.path.exists(ftpdPath):
-                shutil.rmtree(ftpdPath)
-                if mysql == 'Two':
-                    shutil.copytree("pure-ftpd", ftpdPath)
-                else:
-                    shutil.copytree("pure-ftpd-one", ftpdPath)
-            else:
-                if mysql == 'Two':
-                    shutil.copytree("pure-ftpd", ftpdPath)
-                else:
-                    shutil.copytree("pure-ftpd-one", ftpdPath)
+            self.copy_config_file("pure-ftpd", ftpdPath, mysql)
 
             if self.distro == ubuntu:
                 try:
@@ -592,13 +1117,13 @@ gpgcheck=1
 
             if self.remotemysql == 'ON':
                 command = "sed -i 's|localhost|%s|g' %s" % (self.mysqlhost, ftpConfPath)
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 command = "sed -i 's|3306|%s|g' %s" % (self.mysqlport, ftpConfPath)
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 command = "sed -i 's|MYSQLSocket /var/lib/mysql/mysql.sock||g' %s" % (ftpConfPath)
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
             if self.distro == ubuntu:
 
@@ -624,13 +1149,13 @@ gpgcheck=1
                 subprocess.call(command, shell=True)
 
                 command = 'ln -s /etc/pure-ftpd/conf/MySQLConfigFile /etc/pure-ftpd/auth/30mysql'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 command = 'ln -s /etc/pure-ftpd/conf/UnixAuthentication /etc/pure-ftpd/auth/65unix'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 command = 'systemctl restart pure-ftpd-mysql.service'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
 
 
@@ -639,10 +1164,10 @@ gpgcheck=1
                     ### change mysql md5 to crypt
 
                     command = "sed -i 's/MYSQLCrypt md5/MYSQLCrypt crypt/g' /etc/pure-ftpd/db/mysql.conf"
-                    install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                    install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                     command = "systemctl restart pure-ftpd-mysql.service"
-                    install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                    install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
             else:
 
                 try:
@@ -652,7 +1177,7 @@ gpgcheck=1
 
                     if type == 'al' and version >= 90:
                         command = "sed -i 's/MYSQLCrypt md5/MYSQLCrypt crypt/g' /etc/pure-ftpd/pureftpd-mysql.conf"
-                        install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                        install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
                 except:
                     pass
 
@@ -666,43 +1191,43 @@ gpgcheck=1
 
     def installPowerDNS(self):
         try:
-
             if self.distro == ubuntu or self.distro == cent8 or self.distro == openeuler:
-                command = 'systemctl stop systemd-resolved'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
-                command = 'systemctl disable systemd-resolved.service'
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+                # Stop and disable systemd-resolved
+                self.manage_service('systemd-resolved', 'stop')
+                self.manage_service('systemd-resolved.service', 'disable')
 
                 try:
-                    os.rename('/etc/resolv.conf', 'etc/resolved.conf')
+                    os.rename('/etc/resolv.conf', '/etc/resolv.conf.bak')
                 except OSError as e:
                     if e.errno != errno.EEXIST and e.errno != errno.ENOENT:
                         InstallCyberPanel.stdOut("[ERROR] Unable to rename /etc/resolv.conf to install PowerDNS: " +
                                                  str(e), 1, 1, os.EX_OSERR)
-                    try:
-                        os.remove('/etc/resolv.conf')
-                    except OSError as e1:
-                        InstallCyberPanel.stdOut(
-                            "[ERROR] Unable to remove existing /etc/resolv.conf to install PowerDNS: " +
-                            str(e1), 1, 1, os.EX_OSERR)
+                
+                # Create a temporary resolv.conf with Google DNS for package installation
+                try:
+                    with open('/etc/resolv.conf', 'w') as f:
+                        f.write('nameserver 8.8.8.8\n')
+                        f.write('nameserver 8.8.4.4\n')
+                    InstallCyberPanel.stdOut("Created temporary /etc/resolv.conf with Google DNS", 1)
+                except IOError as e:
+                    InstallCyberPanel.stdOut("[ERROR] Unable to create /etc/resolv.conf: " + str(e), 1, 1, os.EX_OSERR)
 
-                # try:
-                #     f = open('/etc/resolv.conf', 'a')
-                #     f.write('nameserver 8.8.8.8')
-                #     f.close()
-                # except IOError as e:
-                #     InstallCyberPanel.stdOut("[ERROR] Unable to create /etc/resolv.conf: " + str(e) +
-                #                              ".  This may need to be fixed manually as 'echo \"nameserver 8.8.8.8\"> "
-                #                              "/etc/resolv.conf'", 1, 1, os.EX_OSERR)
-
+            # Install PowerDNS packages
             if self.distro == ubuntu:
+                # Update package list first
+                command = "DEBIAN_FRONTEND=noninteractive apt-get update"
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                
+                # Install PowerDNS packages
                 command = "DEBIAN_FRONTEND=noninteractive apt-get -y install pdns-server pdns-backend-mysql"
-                os.system(command)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR, True)
+                
+                # Ensure service is stopped after installation for configuration
+                command = 'systemctl stop pdns || true'
+                install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR, True)
                 return 1
             else:
-                command = 'yum -y install pdns pdns-backend-mysql'
-
-            install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                self.install_package('pdns pdns-backend-mysql')
 
         except BaseException as msg:
             logging.InstallLog.writeToFile('[ERROR] ' + str(msg) + " [powerDNS]")
@@ -717,19 +1242,75 @@ gpgcheck=1
                 dnsPath = "/etc/pdns/pdns.conf"
             else:
                 dnsPath = "/etc/powerdns/pdns.conf"
+                # Ensure directory exists for Ubuntu
+                dnsDir = os.path.dirname(dnsPath)
+                if not os.path.exists(dnsDir):
+                    try:
+                        os.makedirs(dnsDir, mode=0o755)
+                    except OSError as e:
+                        if e.errno != errno.EEXIST:
+                            raise
 
-            if os.path.exists(dnsPath):
-                os.remove(dnsPath)
-                if mysql == 'Two':
-                    shutil.copy("dns/pdns.conf", dnsPath)
-                else:
-                    shutil.copy("dns-one/pdns.conf", dnsPath)
-            else:
-                if mysql == 'Two':
-                    shutil.copy("dns/pdns.conf", dnsPath)
-                else:
-                    shutil.copy("dns-one/pdns.conf", dnsPath)
+            try:
+                self.copy_config_file("dns", dnsPath, mysql)
+            except Exception as e:
+                InstallCyberPanel.stdOut("[ERROR] Failed to copy PowerDNS config: " + str(e), 1)
+                logging.InstallLog.writeToFile('[ERROR] Failed to copy PowerDNS config: ' + str(e))
+                raise
 
+            # Verify the file was copied and has content
+            if not os.path.exists(dnsPath):
+                raise IOError(f"PowerDNS config file not found at {dnsPath} after copy")
+            
+            # Check if file has content
+            with open(dnsPath, "r") as f:
+                content = f.read()
+                if not content or "launch=gmysql" not in content:
+                    InstallCyberPanel.stdOut("[WARNING] PowerDNS config appears empty or incomplete, attempting to fix...", 1)
+                    
+                    # First try to re-copy
+                    try:
+                        if os.path.exists(dnsPath):
+                            os.remove(dnsPath)
+                        source_file = os.path.join(self.cwd, "dns-one", "pdns.conf")
+                        shutil.copy2(source_file, dnsPath)
+                    except Exception as copy_error:
+                        InstallCyberPanel.stdOut("[WARNING] Failed to re-copy config: " + str(copy_error), 1)
+                        
+                        # Fallback: directly write the essential MySQL configuration
+                        InstallCyberPanel.stdOut("[INFO] Directly writing MySQL backend configuration...", 1)
+                        try:
+                            mysql_config = f"""# PowerDNS MySQL Backend Configuration
+launch=gmysql
+gmysql-host=localhost
+gmysql-port=3306
+gmysql-user=cyberpanel
+gmysql-password={mysqlPassword}
+gmysql-dbname=cyberpanel
+
+# Basic PowerDNS settings
+daemon=no
+guardian=no
+setgid=pdns
+setuid=pdns
+"""
+                            # If file exists and has some content, append our config
+                            if os.path.exists(dnsPath) and content.strip():
+                                # Check if it's just missing the MySQL part
+                                with open(dnsPath, "a") as f:
+                                    f.write("\n\n" + mysql_config)
+                            else:
+                                # Write a complete minimal config
+                                with open(dnsPath, "w") as f:
+                                    f.write(mysql_config)
+                            
+                            InstallCyberPanel.stdOut("[SUCCESS] MySQL backend configuration written directly", 1)
+                        except Exception as write_error:
+                            InstallCyberPanel.stdOut("[ERROR] Failed to write MySQL config: " + str(write_error), 1)
+                            raise
+            
+            InstallCyberPanel.stdOut("PowerDNS config file prepared at: " + dnsPath, 1)
+            
             data = open(dnsPath, "r").readlines()
 
             writeDataToFile = open(dnsPath, "w")
@@ -749,10 +1330,22 @@ gpgcheck=1
 
             if self.remotemysql == 'ON':
                 command = "sed -i 's|gmysql-host=localhost|gmysql-host=%s|g' %s" % (self.mysqlhost, dnsPath)
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
 
                 command = "sed -i 's|gmysql-port=3306|gmysql-port=%s|g' %s" % (self.mysqlport, dnsPath)
-                install.preFlightsChecks.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+                install_utils.call(command, self.distro, command, command, 1, 1, os.EX_OSERR)
+
+            # Set proper permissions for PowerDNS config
+            if self.distro == ubuntu:
+                # Ensure pdns user/group exists
+                command = 'id -u pdns &>/dev/null || useradd -r -s /usr/sbin/nologin pdns'
+                install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+                
+                command = 'chown root:pdns %s' % dnsPath
+                install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+                
+                command = 'chmod 640 %s' % dnsPath
+                install_utils.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
 
             InstallCyberPanel.stdOut("PowerDNS configured!", 1)
 
@@ -765,17 +1358,22 @@ gpgcheck=1
 
         ############## Start PowerDNS ######################
 
-        command = 'systemctl enable pdns'
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
-
-        command = 'systemctl start pdns'
-        install.preFlightsChecks.call(command, self.distro, command, command, 1, 0, os.EX_OSERR)
+        self.manage_service('pdns', 'enable')
+        
+        # During fresh installation, don't start PowerDNS yet
+        # It will be started after Django migrations create the required tables
+        InstallCyberPanel.stdOut("PowerDNS enabled for startup.", 1)
+        InstallCyberPanel.stdOut("Note: PowerDNS will start after database setup is complete.", 1)
+        logging.InstallLog.writeToFile("PowerDNS enabled but not started - waiting for Django migrations")
+        
+        # The service will be started later after migrations run
+        # or manually by the admin after installation completes
 
 
 def Main(cwd, mysql, distro, ent, serial=None, port="8090", ftp=None, dns=None, publicip=None, remotemysql=None,
          mysqlhost=None, mysqldb=None, mysqluser=None, mysqlpassword=None, mysqlport=None):
-    InstallCyberPanel.mysqlPassword = randomPassword.generate_pass()
-    InstallCyberPanel.mysql_Root_password = randomPassword.generate_pass()
+    InstallCyberPanel.mysqlPassword = install_utils.generate_pass()
+    InstallCyberPanel.mysql_Root_password = install_utils.generate_pass()
 
     file_name = '/etc/cyberpanel/mysqlPassword'
 
@@ -802,19 +1400,21 @@ def Main(cwd, mysql, distro, ent, serial=None, port="8090", ftp=None, dns=None, 
 
     try:
         command = 'chmod 640 %s' % (file_name)
-        install.preFlightsChecks.call(command, distro, '[chmod]',
+        install_utils.call(command, distro, '[chmod]',
                                       '',
                                       1, 0, os.EX_OSERR)
         command = 'chown root:cyberpanel %s' % (file_name)
-        install.preFlightsChecks.call(command, distro, '[chmod]',
+        install_utils.call(command, distro, '[chmod]',
                                       '',
                                       1, 0, os.EX_OSERR)
     except:
         pass
 
-    if distro == centos:
-        InstallCyberPanel.mysqlPassword = randomPassword.generate_pass()
+    # For RHEL-based systems (CentOS, AlmaLinux, Rocky, etc.), generate a separate password
+    if distro in [centos, cent8, openeuler]:
+        InstallCyberPanel.mysqlPassword = install_utils.generate_pass()
     else:
+        # For Ubuntu/Debian, use the same password as root
         InstallCyberPanel.mysqlPassword = InstallCyberPanel.mysql_Root_password
 
     installer = InstallCyberPanel("/usr/local/lsws/", cwd, distro, ent, serial, port, ftp, dns, publicip, remotemysql,
@@ -828,6 +1428,11 @@ def Main(cwd, mysql, distro, ent, serial=None, port="8090", ftp=None, dns=None, 
     installer.installAllPHPVersions()
     if ent == 0:
         installer.fix_ols_configs()
+
+    logging.InstallLog.writeToFile('Installing Sieve for email filtering..,55')
+    installer.installSieve()
+
+    ## setupWebmail is called later, after Dovecot is installed (see install.py)
 
     logging.InstallLog.writeToFile('Installing MySQL,60')
     installer.installMySQL(mysql)

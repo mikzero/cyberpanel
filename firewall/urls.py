@@ -32,18 +32,25 @@ urlpatterns = [
     path('modSecRulesPacks', views.modSecRulesPacks, name='modSecRulesPacks'),
     path('getOWASPAndComodoStatus', views.getOWASPAndComodoStatus, name='getOWASPAndComodoStatus'),
     path('installModSecRulesPack', views.installModSecRulesPack, name='installModSecRulesPack'),
+    
+    # Firewall Export/Import
+    path('exportFirewallRules', views.exportFirewallRules, name='exportFirewallRules'),
+    path('importFirewallRules', views.importFirewallRules, name='importFirewallRules'),
+    
+    # Firewall Rule Edit
+    path('editRule', views.editRule, name='editRule'),
     path('getRulesFiles', views.getRulesFiles, name='getRulesFiles'),
     path('enableDisableRuleFile', views.enableDisableRuleFile, name='enableDisableRuleFile'),
 
-    # CSF
-    path('csf', views.csf, name='csf'),
-    path('installCSF', views.installCSF, name='installCSF'),
-    path('installStatusCSF', views.installStatusCSF, name='installStatusCSF'),
-    path('removeCSF', views.removeCSF, name='removeCSF'),
-    path('fetchCSFSettings', views.fetchCSFSettings, name='fetchCSFSettings'),
-    path('changeStatus', views.changeStatus, name='changeStatus'),
-    path('modifyPorts', views.modifyPorts, name='modifyPorts'),
-    path('modifyIPs', views.modifyIPs, name='modifyIPs'),
+    # CSF - Discontinued on August 31, 2025
+    # path('csf', views.csf, name='csf'),
+    # path('installCSF', views.installCSF, name='installCSF'),
+    # path('installStatusCSF', views.installStatusCSF, name='installStatusCSF'),
+    # path('removeCSF', views.removeCSF, name='removeCSF'),
+    # path('fetchCSFSettings', views.fetchCSFSettings, name='fetchCSFSettings'),
+    # path('changeStatus', views.changeStatus, name='changeStatus'),
+    # path('modifyPorts', views.modifyPorts, name='modifyPorts'),
+    # path('modifyIPs', views.modifyIPs, name='modifyIPs'),
 
     # Imunify
     path('imunify', views.imunify, name='imunify'),

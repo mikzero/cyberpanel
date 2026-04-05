@@ -125,7 +125,7 @@ class mailUtilities:
         "authPlainLine": false
     },
     "Sieve": {
-        "host": "",
+        "host": "localhost",
         "port": 4190,
         "type": 0,
         "timeout": 10,
@@ -325,21 +325,47 @@ class mailUtilities:
             emailLimits = EmailLimits(email=emailAcct)
             emailLimits.save()
 
-            ### Create email folders manually if they dont exist
+            ### Create maildir structure if it doesn't exist
+            
+            # Create base maildir path
+            maildir_base = f"/home/vmail/{domain}/{userName}"
+            maildir_path = f"{maildir_base}/Maildir"
+            
+            # Create the main maildir structure
+            if not os.path.exists(maildir_path):
+                command = f"mkdir -p '{maildir_path}/cur' '{maildir_path}/new' '{maildir_path}/tmp'"
+                ProcessUtilities.executioner(command, 'vmail')
+                
+                # Set proper permissions
+                command = f"chmod -R 700 '{maildir_base}'"
+                ProcessUtilities.executioner(command, 'vmail')
+                
+                # Ensure ownership is correct
+                command = f"chown -R vmail:vmail '{maildir_base}'"
+                ProcessUtilities.executioner(command, 'root')
 
-            # command = f"mkdir '/home/vmail/{domain}/{userName}/Maildir/.Archive' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Deleted Items' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Drafts' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Sent' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Junk E-mail'"
-            # ProcessUtilities.executioner(command, 'vmail')
-            #
-            # command = f"chmod 700 '/home/vmail/{domain}/{userName}/Maildir/.Archive' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Deleted Items' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Drafts' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Sent' " \
-            #           f"'/home/vmail/{domain}/{userName}/Maildir/.Junk E-mail'"
-            # ProcessUtilities.executioner(command, 'vmail')
+            # Create standard IMAP folders
+            standard_folders = [
+                ".Archive",
+                ".Deleted Items", 
+                ".Drafts",
+                ".Sent",
+                ".Junk E-mail"
+            ]
+            
+            for folder in standard_folders:
+                folder_path = f"{maildir_path}/{folder}"
+                if not os.path.exists(folder_path):
+                    command = f"mkdir -p '{folder_path}/cur' '{folder_path}/new' '{folder_path}/tmp'"
+                    ProcessUtilities.executioner(command, 'vmail')
+            
+            # Set permissions for all folders
+            command = f"chmod -R 700 '{maildir_path}'"
+            ProcessUtilities.executioner(command, 'vmail')
+            
+            # Ensure final ownership
+            command = f"chown -R vmail:vmail '{maildir_base}'"
+            ProcessUtilities.executioner(command, 'root')
 
             #if not os.path.exists('/usr/local/lscp/cyberpanel/rainloop/data/_data_/_default_/plugins/mailbox-detect'):
             #    mailUtilities.InstallMailBoxFoldersPlugin()
@@ -378,20 +404,15 @@ class mailUtilities:
     @staticmethod
     def changeEmailPassword(email, newPassword, encrypt = None):
         try:
+            changePass = EUsers.objects.get(email=email)
             if encrypt == None:
-                CentOSPath = '/etc/redhat-release'
-                changePass = EUsers.objects.get(email=email)
-                if os.path.exists(CentOSPath):
-                    password = bcrypt.hashpw(newPassword.encode('utf-8'), bcrypt.gensalt())
-                    password = '{CRYPT}%s' % (password.decode())
-                    changePass.password = password
-                else:
-                    changePass.password = newPassword
-                changePass.save()
+                # Always use bcrypt hashing regardless of OS
+                password = bcrypt.hashpw(newPassword.encode('utf-8'), bcrypt.gensalt())
+                password = '{CRYPT}%s' % (password.decode())
+                changePass.password = password
             else:
-                changePass = EUsers.objects.get(email=email)
                 changePass.password = newPassword
-                changePass.save()
+            changePass.save()
             return 0,'None'
         except BaseException as msg:
             return 0, str(msg)
@@ -560,6 +581,12 @@ InternalHosts	refile:/etc/opendkim/TrustedHosts
                 ## Configure postfix specific settings
 
                 postfixFilePath = "/etc/postfix/main.cf"
+
+                # Check if postfix main.cf exists before configuring
+                if not os.path.exists(postfixFilePath):
+                    logging.CyberCPLogFileWriter.writeToFile(f"configureOpenDKIM: {postfixFilePath} not found, skipping postfix DKIM configuration")
+                    print("1,Postfix not installed")
+                    return
 
                 configData = """
 smtpd_milters = inet:127.0.0.1:8891
@@ -1677,6 +1704,109 @@ LogFile /var/log/clamav/clamav.log
 
 
 
+    @staticmethod
+    def configureRelayHost(smtpHost, smtpPort, smtpUser, smtpPassword):
+        try:
+            ## Ensure cyrus-sasl-plain is installed (required for SASL PLAIN auth on RHEL/Alma/CentOS)
+            if os.path.exists('/etc/redhat-release'):
+                ProcessUtilities.executioner('dnf install -y cyrus-sasl-plain')
+            elif os.path.exists('/usr/bin/apt-get'):
+                ProcessUtilities.executioner('apt-get install -y libsasl2-modules')
+
+            postfixPath = '/etc/postfix/main.cf'
+
+            with open(postfixPath, 'r') as f:
+                lines = f.readlines()
+
+            relayKeys = ['relayhost', 'smtp_sasl_auth_enable', 'smtp_sasl_password_maps',
+                         'smtp_sasl_security_options', 'smtp_tls_security_level']
+
+            filteredLines = []
+            for line in lines:
+                stripped = line.strip()
+                skip = False
+                for key in relayKeys:
+                    if stripped.startswith(key + ' ') or stripped.startswith(key + '='):
+                        skip = True
+                        break
+                if not skip:
+                    filteredLines.append(line)
+
+            relayConfig = [
+                '\n# CyberMail SMTP Relay Configuration\n',
+                'relayhost = [%s]:%s\n' % (smtpHost, smtpPort),
+                'smtp_sasl_auth_enable = yes\n',
+                'smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd\n',
+                'smtp_sasl_security_options = noanonymous\n',
+                'smtp_tls_security_level = encrypt\n',
+            ]
+
+            with open(postfixPath, 'w') as f:
+                f.writelines(filteredLines)
+                f.writelines(relayConfig)
+
+            saslPath = '/etc/postfix/sasl_passwd'
+            with open(saslPath, 'w') as f:
+                f.write('[%s]:%s %s:%s\n' % (smtpHost, smtpPort, smtpUser, smtpPassword))
+
+            os.chmod(saslPath, 0o600)
+
+            ProcessUtilities.executioner('postmap /etc/postfix/sasl_passwd')
+            ProcessUtilities.executioner('systemctl reload postfix')
+
+            print('1,None')
+
+        except BaseException as msg:
+            logging.CyberCPLogFileWriter.writeToFile(str(msg) + ' [configureRelayHost]')
+            print('0,%s' % str(msg))
+
+    @staticmethod
+    def removeRelayHost():
+        try:
+            postfixPath = '/etc/postfix/main.cf'
+
+            with open(postfixPath, 'r') as f:
+                lines = f.readlines()
+
+            relayKeys = ['relayhost', 'smtp_sasl_auth_enable', 'smtp_sasl_password_maps',
+                         'smtp_sasl_security_options']
+            commentLine = '# CyberMail SMTP Relay Configuration\n'
+
+            filteredLines = []
+            for line in lines:
+                stripped = line.strip()
+                if line == commentLine:
+                    continue
+                skip = False
+                for key in relayKeys:
+                    if stripped.startswith(key + ' ') or stripped.startswith(key + '='):
+                        skip = True
+                        break
+                if not skip:
+                    if stripped.startswith('smtp_tls_security_level'):
+                        filteredLines.append('smtp_tls_security_level = may\n')
+                    else:
+                        filteredLines.append(line)
+
+            with open(postfixPath, 'w') as f:
+                f.writelines(filteredLines)
+
+            saslPath = '/etc/postfix/sasl_passwd'
+            saslDbPath = '/etc/postfix/sasl_passwd.db'
+
+            if os.path.exists(saslPath):
+                os.remove(saslPath)
+            if os.path.exists(saslDbPath):
+                os.remove(saslDbPath)
+
+            ProcessUtilities.executioner('systemctl reload postfix')
+
+            print('1,None')
+
+        except BaseException as msg:
+            logging.CyberCPLogFileWriter.writeToFile(str(msg) + ' [removeRelayHost]')
+            print('0,%s' % str(msg))
+
     ####### Imported below functions from mailserver/mailservermanager, need to refactor later
 
 class MailServerManagerUtils(multi.Thread):
@@ -1811,7 +1941,7 @@ class MailServerManagerUtils(multi.Thread):
 
             if ProcessUtilities.decideDistro() == ProcessUtilities.centos:
 
-                command = 'yum --nogpg install https://mirror.ghettoforge.org/distributions/gf/gf-release-latest.gf.el7.noarch.rpm -y'
+                command = 'yum --nogpg install https://mirror.ghettoforge.net/distributions/gf/gf-release-latest.gf.el7.noarch.rpm -y'
                 ProcessUtilities.executioner(command)
 
                 command = 'yum install --enablerepo=gf-plus -y postfix3 postfix3-ldap postfix3-mysql postfix3-pcre'
@@ -1822,11 +1952,11 @@ class MailServerManagerUtils(multi.Thread):
                 version = int(clAPVersion.split('-')[1])
 
                 if type == 'al' and version >= 90:
-                    command = 'dnf --nogpg install -y https://mirror.ghettoforge.org/distributions/gf/gf-release-latest.gf.el9.noarch.rpm'
+                    command = 'dnf --nogpg install -y https://mirror.ghettoforge.net/distributions/gf/gf-release-latest.gf.el9.noarch.rpm'
                     ProcessUtilities.executioner(command)
 
                 else:
-                    command = 'dnf --nogpg install -y https://mirror.ghettoforge.org/distributions/gf/gf-release-latest.gf.el8.noarch.rpm'
+                    command = 'dnf --nogpg install -y https://mirror.ghettoforge.net/distributions/gf/gf-release-latest.gf.el8.noarch.rpm'
                     ProcessUtilities.executioner(command)
 
                 command = 'dnf install --enablerepo=gf-plus postfix3 postfix3-mysql -y'
@@ -2692,6 +2822,7 @@ milter_default_action = accept
             return 1, 'All checks are OK.'
 
 
+
 def main():
 
     parser = argparse.ArgumentParser(description='CyberPanel Installer')
@@ -2702,6 +2833,10 @@ def main():
     parser.add_argument('--tempConfigPath', help='Temporary Configuration Path!')
     parser.add_argument('--install', help='Enable/Disable Policy Server!')
     parser.add_argument('--tempStatusPath', help='Path of temporary status file.')
+    parser.add_argument('--smtpHost', help='SMTP relay host!')
+    parser.add_argument('--smtpPort', help='SMTP relay port!')
+    parser.add_argument('--smtpUser', help='SMTP relay username!')
+    parser.add_argument('--smtpPassword', help='SMTP relay password!')
 
 
 
@@ -2745,6 +2880,10 @@ def main():
         mailUtilities.SetupEmailLimits()
     elif args.function == 'SaveEmailLimitsNew':
         mailUtilities.SaveEmailLimitsNew(args.tempConfigPath)
+    elif args.function == 'configureRelayHost':
+        mailUtilities.configureRelayHost(args.smtpHost, args.smtpPort, args.smtpUser, args.smtpPassword)
+    elif args.function == 'removeRelayHost':
+        mailUtilities.removeRelayHost()
 
 if __name__ == "__main__":
     main()

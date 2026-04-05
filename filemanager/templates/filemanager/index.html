@@ -41,7 +41,15 @@
 
 <nav id="navBar" class="navbar navbar-expand-lg navbar-light bg-light">
     <div class="header-logo">
-        <a href="/websites/{{ domainName }}"><img src="{% static 'filemanager/images/fileManager.png' %}"> <span style="display: none" id="domainNameInitial">{{ domainName }}</span></a>
+        <a href="/websites/{{ domainName }}">
+            <div class="logo-icon">
+                <i class="fa fa-folder-open"></i>
+            </div>
+            <div class="logo-text">
+                <span class="brand">File Manager</span>
+                <span class="domain" id="domainNameInitial">{{ domainName }}</span>
+            </div>
+        </a>
     </div>
     <!--- second bar ---->
 
@@ -175,7 +183,7 @@
     <div class="modal-dialog modal-lg">
         <div class="modal-content">
             <div id="uploadBoxLabel" class="modal-header">
-                <h5 class="modal-title" >{% trans "Upload File" %} - <a  target="_blank" href="https://go.cyberpanel.net/upload-limits" title="">{% trans "Upload Limits" %}</a></h5>
+                <h5 class="modal-title" >{% trans "Upload File" %} - <a  target="_blank" rel="noopener" href="https://cyberpanel.net/KnowledgeBase/home/website-file-manager/" title="">{% trans "Upload Limits" %}</a></h5>
                 <button type="button" class="close" data-dismiss="modal" aria-label="Close">
                     <span aria-hidden="true">&times;</span>
                 </button>

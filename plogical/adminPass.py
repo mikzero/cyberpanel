@@ -12,8 +12,8 @@ from plogical.acl import ACLManager
 from packages.models import Package
 from baseTemplate.models import version
 
-VERSION = '2.3'
-BUILD = 9
+VERSION = '2.4'
+BUILD = 4
 
 if not os.geteuid() == 0:
     sys.exit("\nOnly root can run this script\n")
@@ -47,7 +47,7 @@ def main():
             acl = ACL.objects.get(name='admin')
             token = hashPassword.generateToken('admin', adminPass)
 
-            email = 'example@example.org'
+            email = 'admin@cyberpanel.net'
             admin = Administrator(userName="admin", password=hashPassword.hash_password(adminPass), type=1, email=email,
                                   firstName="Cyber", lastName="Panel", acl=acl, token=token)
             admin.save()

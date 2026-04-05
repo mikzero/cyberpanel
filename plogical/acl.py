@@ -14,7 +14,7 @@ django.setup()
 from loginSystem.models import Administrator, ACL
 from django.shortcuts import HttpResponse
 from packages.models import Package
-from websiteFunctions.models import Websites, ChildDomains, aliasDomains, DockerSites
+from websiteFunctions.models import Websites, ChildDomains, aliasDomains, DockerSites, WPSites
 import json
 from subprocess import call, CalledProcessError
 from shlex import split
@@ -582,24 +582,44 @@ class ACLManager:
 
     @staticmethod
     def searchWebsiteObjects(currentACL, userID, searchTerm):
-
         if currentACL['admin'] == 1:
-            return Websites.objects.filter(domain__istartswith=searchTerm)
+            # Get websites that match the search term
+            websites = Websites.objects.filter(domain__istartswith=searchTerm)
+            # Get WordPress sites that match the search term
+            wp_sites = WPSites.objects.filter(title__icontains=searchTerm)
+            # Add WordPress sites' parent websites to the results
+            for wp in wp_sites:
+                if wp.owner not in websites:
+                    websites = websites | Websites.objects.filter(pk=wp.owner.pk)
+            return websites
         else:
             websiteList = []
             admin = Administrator.objects.get(pk=userID)
 
+            # Get websites that match the search term
             websites = admin.websites_set.filter(domain__istartswith=searchTerm)
-
             for items in websites:
                 websiteList.append(items)
 
-            admins = Administrator.objects.filter(owner=admin.pk)
+            # Get WordPress sites that match the search term
+            wp_sites = WPSites.objects.filter(title__icontains=searchTerm)
+            for wp in wp_sites:
+                if wp.owner.admin == admin and wp.owner not in websiteList:
+                    websiteList.append(wp.owner)
 
+            admins = Administrator.objects.filter(owner=admin.pk)
             for items in admins:
+                # Get websites that match the search term
                 webs = items.websites_set.filter(domain__istartswith=searchTerm)
                 for web in webs:
-                    websiteList.append(web)
+                    if web not in websiteList:
+                        websiteList.append(web)
+                
+                # Get WordPress sites that match the search term
+                wp_sites = WPSites.objects.filter(title__icontains=searchTerm)
+                for wp in wp_sites:
+                    if wp.owner.admin == items and wp.owner not in websiteList:
+                        websiteList.append(wp.owner)
 
             return websiteList
 
@@ -705,6 +725,31 @@ class ACLManager:
         return domainsList
 
     @staticmethod
+    def findAllDNSZones(currentACL, userID):
+        from dns.models import Domains
+        zonesList = []
+        
+        if currentACL['admin'] == 1:
+            zones = Domains.objects.all().order_by('name')
+            for zone in zones:
+                zonesList.append(zone.name)
+        else:
+            admin = Administrator.objects.get(pk=userID)
+            zones = Domains.objects.filter(admin=admin).order_by('name')
+            
+            for zone in zones:
+                zonesList.append(zone.name)
+            
+            # Include zones from owned admins
+            admins = Administrator.objects.filter(owner=admin.pk)
+            for item in admins:
+                owned_zones = Domains.objects.filter(admin=item).order_by('name')
+                for zone in owned_zones:
+                    zonesList.append(zone.name)
+        
+        return list(set(zonesList))  # Remove duplicates
+    
+    @staticmethod
     def checkOwnership(domain, admin, currentACL):
         try:
             childDomain = ChildDomains.objects.get(domain=domain)
@@ -716,6 +761,8 @@ class ACLManager:
             else:
                 if childDomain.master.admin.owner == admin.pk:
                     return 1
+                else:
+                    return 0
 
         except:
             domainName = Websites.objects.get(domain=domain)
@@ -747,20 +794,39 @@ class ACLManager:
 
     @staticmethod
     def checkOwnershipZone(domain, admin, currentACL):
-        try:
-            domain = Websites.objects.get(domain=domain)
-        except:
-            domain = ChildDomains.objects.get(domain=domain)
-            domain = domain.master
-
+        # First check if user is admin
         if currentACL['admin'] == 1:
             return 1
-        elif domain.admin == admin:
-            return 1
-        elif domain.admin.owner == admin.pk:
-            return 1
-        else:
-            return 0
+            
+        # Try to find domain in Websites table
+        try:
+            websiteDomain = Websites.objects.get(domain=domain)
+            if websiteDomain.admin == admin or websiteDomain.admin.owner == admin.pk:
+                return 1
+        except:
+            pass
+            
+        # Try to find domain in ChildDomains table
+        try:
+            childDomain = ChildDomains.objects.get(domain=domain)
+            if childDomain.master.admin == admin or childDomain.master.admin.owner == admin.pk:
+                return 1
+        except:
+            pass
+            
+        # Try to find domain in DNS Domains table (for standalone DNS zones)
+        try:
+            from dns.models import Domains
+            dnsDomain = Domains.objects.get(name=domain)
+            if dnsDomain.admin == admin:
+                return 1
+            # Check if the DNS zone is owned by a user owned by current admin
+            if dnsDomain.admin.owner == admin.pk:
+                return 1
+        except:
+            pass
+            
+        return 0
 
     @staticmethod
     def executeCall(command):
@@ -1308,7 +1374,7 @@ echo $oConfig->Save() ? 'Done' : 'Error';
             command = 'chmod 640 /usr/local/lscp/cyberpanel/logs/access.log'
             ProcessUtilities.executioner(command, 'root', True)
 
-            command = '/usr/local/lsws/lsphp72/bin/php /usr/local/CyberCP/public/snappymail.php'
+            command = '/usr/local/lsws/lsphp83/bin/php /usr/local/CyberCP/public/snappymail.php'
             ProcessUtilities.executioner(command, 'root', True)
 
             command = 'chmod 600 /usr/local/CyberCP/public/snappymail.php'

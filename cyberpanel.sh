@@ -4,8 +4,91 @@
 #set -x
 #set -u
 
+# Logging setup
+LOG_DIR="/var/log/cyberpanel"
+LOG_FILE="$LOG_DIR/cyberpanel_install_$(date +%Y%m%d_%H%M%S).log"
+DEBUG_LOG_FILE="$LOG_DIR/cyberpanel_install_debug_$(date +%Y%m%d_%H%M%S).log"
 
-#CyberPanel installer script for CentOS 7, CentOS 8, CloudLinux 7, AlmaLinux 8, RockyLinux 8, Ubuntu 18.04, Ubuntu 20.04, Ubuntu 20.10, openEuler 20.03 and openEuler 22.03
+# Create log directory if it doesn't exist
+mkdir -p "$LOG_DIR" 2>/dev/null || {
+    # If /var/log/cyberpanel cannot be created, use /tmp
+    LOG_DIR="/tmp/cyberpanel_logs"
+    mkdir -p "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/cyberpanel_install_$(date +%Y%m%d_%H%M%S).log"
+    DEBUG_LOG_FILE="$LOG_DIR/cyberpanel_install_debug_$(date +%Y%m%d_%H%M%S).log"
+}
+
+# Logging functions
+log_info() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [INFO] $message" | tee -a "$LOG_FILE"
+}
+
+log_error() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [ERROR] $message" | tee -a "$LOG_FILE" >&2
+}
+
+log_warning() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [WARNING] $message" | tee -a "$LOG_FILE"
+}
+
+log_debug() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [DEBUG] $message" >> "$DEBUG_LOG_FILE"
+}
+
+log_command() {
+    local command="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [COMMAND] Executing: $command" >> "$DEBUG_LOG_FILE"
+
+    # Execute command and capture output
+    local output
+    local exit_code
+    output=$($command 2>&1)
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        echo "[$timestamp] [COMMAND] Success: $command" >> "$DEBUG_LOG_FILE"
+        [ -n "$output" ] && echo "[$timestamp] [OUTPUT] $output" >> "$DEBUG_LOG_FILE"
+    else
+        echo "[$timestamp] [COMMAND] Failed (exit code: $exit_code): $command" >> "$DEBUG_LOG_FILE"
+        [ -n "$output" ] && echo "[$timestamp] [ERROR OUTPUT] $output" >> "$DEBUG_LOG_FILE"
+    fi
+
+    return $exit_code
+}
+
+log_function_start() {
+    local function_name="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [FUNCTION] Starting: $function_name" | tee -a "$LOG_FILE"
+    echo "[$timestamp] [FUNCTION] Starting: $function_name with args: ${@:2}" >> "$DEBUG_LOG_FILE"
+}
+
+log_function_end() {
+    local function_name="$1"
+    local exit_code="${2:-0}"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    if [ $exit_code -eq 0 ]; then
+        echo "[$timestamp] [FUNCTION] Completed: $function_name" >> "$DEBUG_LOG_FILE"
+    else
+        echo "[$timestamp] [FUNCTION] Failed: $function_name (exit code: $exit_code)" | tee -a "$LOG_FILE"
+    fi
+}
+
+# Initialize logging
+log_info "CyberPanel installation started"
+log_info "Log file: $LOG_FILE"
+log_info "Debug log file: $DEBUG_LOG_FILE"
+
+#CyberPanel installer script for CentOS 7, CentOS 8, CloudLinux 7, AlmaLinux 8, AlmaLinux 9, AlmaLinux 10, RockyLinux 8, Ubuntu 18.04, Ubuntu 20.04, Ubuntu 20.10, Ubuntu 22.04, Ubuntu 24.04, Ubuntu 24.04.3, openEuler 20.03 and openEuler 22.03
 #For whoever may edit this script, please follow:
 #Please use Pre_Install_xxx() and Post_Install_xxx() if you want to something respectively before or after the panel installation
 #and update below accordingly
@@ -16,7 +99,7 @@
 #Set_Default_Variables() --->  set some default variable for later use
 #Check_Root()  ---> check for root
 #Check_Server_IP()  ---> check for server IP and geolocation at country level
-#Check_OS() ---> check system , support on CentOS 7/8, RockyLinux 8, AlmaLinux 8, Ubuntu 18/20, openEuler 20.03/22.03 and CloudLinux 7, 8 is untested.
+#Check_OS() ---> check system , support on CentOS 7/8, RockyLinux 8, AlmaLinux 8/9/10, Ubuntu 18/20/22/24, openEuler 20.03/22.03 and CloudLinux 7, 8 is untested.
 #Check_Virtualization()  ---> check for virtualizaon , #LXC not supported# , some edit needed on OVZ
 #Check_Panel() --->  check to make sure no other panel is installed
 #Check_Process() ---> check no other process like Apache is running
@@ -45,9 +128,11 @@ Sudo_Test=$(set)
 #for SUDO check
 
 Set_Default_Variables() {
+log_function_start "Set_Default_Variables"
 
 echo -e "Fetching latest data from CyberPanel server...\n"
 echo -e "This may take few seconds..."
+log_info "Fetching latest data from CyberPanel server"
 
 Silent="Off"
 Server_Edition="OLS"
@@ -76,9 +161,12 @@ Branch_Name="v${Panel_Version}.${Panel_Build}"
 
 if [[ $Branch_Name = v*.*.* ]] ; then
   echo -e  "\nBranch name fetched...$Branch_Name"
+  log_info "Branch name fetched: $Branch_Name"
 else
   echo -e "\nUnable to fetch Branch name..."
   echo -e "\nPlease try again in few moments, if this error still happens, please contact support"
+  log_error "Unable to fetch branch name from version.txt"
+  log_function_end "Set_Default_Variables" 1
   exit
 fi
 
@@ -104,6 +192,167 @@ Enterprise_Flag=""
 License_Key=""
 Debug_Log2 "Starting installation..,1"
 
+log_debug "Default variables set - Server Edition: $Server_Edition, Total RAM: $Total_RAM MB"
+log_function_end "Set_Default_Variables"
+}
+
+# Helper Functions for Package Management
+install_package() {
+    local package="$1"
+    case "$Server_OS" in
+        "CentOS"|"openEuler")
+            if [[ "$Server_OS_Version" -ge 8 ]]; then
+                dnf install -y "$package"
+            else
+                yum install -y "$package"
+            fi
+            ;;
+        "Ubuntu")
+            DEBIAN_FRONTEND=noninteractive apt install -y "$package"
+            ;;
+    esac
+}
+
+# Helper Function for Service Management
+manage_service() {
+    local service="$1"
+    local action="$2"
+    systemctl "$action" "$service"
+}
+
+# Helper Function for Development Tools Installation
+install_dev_tools() {
+    case "$Server_OS" in
+        "CentOS"|"openEuler")
+            yum groupinstall "Development Tools" -y
+            yum install autoconf automake zlib-devel openssl-devel expat-devel pcre-devel libmemcached-devel cyrus-sasl* -y
+            ;;
+        "Ubuntu")
+            DEBIAN_FRONTEND=noninteractive apt install build-essential zlib1g-dev libexpat1-dev openssl libssl-dev libsasl2-dev libpcre3-dev git -y
+            ;;
+    esac
+}
+
+# Helper Function for PHP Package Installation
+install_php_packages() {
+    local php_extension="$1"
+    case "$Server_OS" in
+        "CentOS"|"openEuler")
+            install_package "lsphp??-${php_extension} lsphp??-pecl-${php_extension}"
+            ;;
+        "Ubuntu")
+            install_package "lsphp*-${php_extension}"
+            ;;
+    esac
+}
+
+# Helper Function for configuring memcached
+configure_memcached() {
+    if [[ "$Server_OS" = "CentOS" ]] || [[ "$Server_OS" = "openEuler" ]]; then
+        sed -i 's|OPTIONS=""|OPTIONS="-l 127.0.0.1 -U 0"|g' /etc/sysconfig/memcached
+    fi
+}
+
+# Helper Function for EPEL repository setup
+setup_epel_repo() {
+    case "$Server_OS_Version" in
+        "7")
+            rpm --import https://cyberpanel.sh/dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-7
+            yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+            Check_Return "yum repo" "no_exit"
+            ;;
+        "8")
+            rpm --import https://cyberpanel.sh/dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-8
+            yum install -y https://cyberpanel.sh/dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+            Check_Return "yum repo" "no_exit"
+            ;;
+        "9")
+            yum install -y https://cyberpanel.sh/dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+            Check_Return "yum repo" "no_exit"
+            ;;
+        "10")
+            # AlmaLinux 10 EPEL support
+            yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+            Check_Return "yum repo" "no_exit"
+            ;;
+    esac
+}
+
+# Helper Function for MariaDB repository setup
+setup_mariadb_repo() {
+    if [[ "$Server_OS_Version" = "7" ]]; then
+        cat <<EOF >/etc/yum.repos.d/MariaDB.repo
+# MariaDB 10.4 CentOS repository list - created 2021-08-06 02:01 UTC
+# http://downloads.mariadb.org/mariadb/repositories/
+[mariadb]
+name = MariaDB
+baseurl = http://yum.mariadb.org/10.4/centos7-amd64
+gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
+gpgcheck=1
+EOF
+    elif [[ "$Server_OS_Version" = "8" ]]; then
+        cat <<EOF >/etc/yum.repos.d/MariaDB.repo
+# MariaDB 10.11 RHEL8 repository list
+# http://downloads.mariadb.org/mariadb/repositories/
+[mariadb]
+name = MariaDB
+baseurl = http://yum.mariadb.org/10.11/rhel8-amd64
+module_hotfixes=1
+gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
+gpgcheck=1
+EOF
+    elif [[ "$Server_OS_Version" = "9" ]] && uname -m | grep -q 'x86_64'; then
+        cat <<EOF >/etc/yum.repos.d/MariaDB.repo
+# MariaDB 10.11 CentOS repository list - created 2021-08-06 02:01 UTC
+# http://downloads.mariadb.org/mariadb/repositories/
+[mariadb]
+name = MariaDB
+baseurl = http://yum.mariadb.org/10.11/rhel9-amd64/
+gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
+enabled=1
+gpgcheck=1
+EOF
+    elif [[ "$Server_OS_Version" = "10" ]] && uname -m | grep -q 'x86_64'; then
+        cat <<EOF >/etc/yum.repos.d/MariaDB.repo
+# MariaDB 10.11 RHEL10 repository list - AlmaLinux 10 compatible
+# http://downloads.mariadb.org/mariadb/repositories/
+[mariadb]
+name = MariaDB
+baseurl = http://yum.mariadb.org/10.11/rhel10-amd64/
+module_hotfixes=1
+gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
+enabled=1
+gpgcheck=1
+EOF
+    fi
+}
+
+# Helper Function for PHP timezone configuration
+configure_php_timezone() {
+    local php_version="$1"
+    local php_ini_path=$(find "$php_version" -name php.ini)
+
+    # Common configuration
+    "${php_version}/bin/phpize"
+    ./configure --with-php-config="${php_version}/bin/php-config"
+    make
+    make install
+
+    # OS-specific configuration
+    if [[ "$Server_OS" = "CentOS" ]] || [[ "$Server_OS" = "openEuler" ]]; then
+        if [[ ! -d "${php_version}/tmp" ]]; then
+            mkdir "${php_version}/tmp"
+        fi
+        "${php_version}/bin/pecl" channel-update pecl.php.net
+        "${php_version}/bin/pear" config-set temp_dir "${php_version}/tmp"
+        echo "extension=timezonedb.so" > "${php_version}/etc/php.d/20-timezone.ini"
+    else
+        echo "extension=timezonedb.so" > "/usr/local/lsws/${php_version: 16:7}/etc/php/${php_version: 21:1}.${php_version: 22:1}/mods-available/20-timezone.ini"
+    fi
+
+    make clean
+    sed -i 's|expose_php = On|expose_php = Off|g' "$php_ini_path"
+    sed -i 's|mail.add_x_header = On|mail.add_x_header = Off|g' "$php_ini_path"
 }
 
 Debug_Log() {
@@ -155,7 +404,9 @@ fi
 Check_Return() {
   #check previous command result , 0 = ok ,  non-0 = something wrong.
 # shellcheck disable=SC2181
-if [[ $? != "0" ]]; then
+local exit_code=$?
+if [[ $exit_code != "0" ]]; then
+  log_error "Previous command failed with exit code: $exit_code"
   if [[ -n "$1" ]] ; then
     echo -e "\n\n\n$1"
   fi
@@ -172,22 +423,38 @@ fi
 
 Retry_Command() {
 # shellcheck disable=SC2034
+local command="$1"
+log_debug "Starting retry command: $command"
 for i in {1..50};
 do
   if [[ "$i" = "50" ]] ; then
     echo "command $1 failed for 50 times, exit..."
+    log_error "Command failed after 50 retries: $1"
     exit 2
   else
-    $1  && break || echo -e "\n$1 has failed for $i times\nWait for 3 seconds and try again...\n"; sleep 3;
+    eval "$1"  && break || {
+      echo -e "\n$1 has failed for $i times\nWait and try again...\n"
+      log_warning "Command failed, retry $i/50: $1"
+      # Exponential backoff: 1s, 2s, 4s, 8s, then cap at 10s
+      if [[ $i -le 4 ]]; then
+        sleep $((2**($i-1)))
+      else
+        sleep 10
+      fi
+    }
   fi
 done
 }
 
 Check_Root() {
+log_function_start "Check_Root"
 echo -e "\nChecking root privileges..."
+log_info "Checking root privileges"
   if echo "$Sudo_Test" | grep SUDO >/dev/null; then
     echo -e "\nYou are using SUDO , please run as root user...\n"
     echo -e "\nIf you don't have direct access to root user, please run \e[31msudo su -\e[39m command (do NOT miss the \e[31m-\e[39m at end or it will fail) and then run installation command again."
+    log_error "Not running as root user - SUDO detected"
+    log_function_end "Check_Root" 1
     exit
   fi
 
@@ -195,19 +462,28 @@ echo -e "\nChecking root privileges..."
     echo -e "\nYou must run on root user to install CyberPanel...\n"
     echo -e "or run following command: (do NOT miss the quotes)"
     echo -e "\e[31msudo su -c \"sh <(curl https://cyberpanel.sh || wget -O - https://cyberpanel.sh)\"\e[39m"
+    log_error "Not running as root user - UID is not 0"
+    log_function_end "Check_Root" 1
     exit 1
   else
     echo -e "\nYou are runing as root...\n"
+    log_info "Root user verified"
   fi
+  log_function_end "Check_Root"
 }
 
 Check_Server_IP() {
+log_function_start "Check_Server_IP"
+log_debug "Fetching server IP address"
 Server_IP=$(curl --silent --max-time 30 -4 https://cyberpanel.sh/?ip)
   if [[ $Server_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo -e "Valid IP detected..."
+    log_info "Valid server IP detected: $Server_IP"
   else
     echo -e "Can not detect IP, exit..."
     Debug_Log2 "Can not detect IP. [404]"
+    log_error "Failed to detect valid server IP address"
+    log_function_end "Check_Server_IP" 1
     exit
   fi
 
@@ -234,12 +510,18 @@ fi
 if [[ "$Server_Country" = *"CN"* ]] ; then
   Server_Country="CN"
   echo -e "Setting up to use mirror server...\n"
+  log_info "Server country set to CN - will use mirror servers"
 fi
+log_debug "Server location: $Server_Country, IP: $Server_IP"
+log_function_end "Check_Server_IP"
 }
 
 Check_OS() {
+log_function_start "Check_OS"
 if [[ ! -f /etc/os-release ]] ; then
+  log_error "Unable to detect the operating system - /etc/os-release not found"
   echo -e "Unable to detect the operating system...\n"
+  log_function_end "Check_OS" 1
   exit
 fi
 
@@ -248,7 +530,7 @@ if [ -z "$XDG_CURRENT_DESKTOP" ]; then
     echo -e "Desktop OS not detected. Proceeding\n"
 else
     echo "$XDG_CURRENT_DESKTOP defined appears to be a desktop OS. Bailing as CyberPanel is incompatible."
-    echo -e "\nCyberPanel is supported on server OS types only. Such as Ubuntu 18.04 x86_64, Ubuntu 20.04 x86_64, Ubuntu 20.10 x86_64, Ubuntu 22.04 x86_64, CentOS 8.x, AlmaLinux 8.x and CloudLinux 7.x...\n"
+    echo -e "\nCyberPanel is supported on server OS types only. Such as Ubuntu 18.04 x86_64, Ubuntu 20.04 x86_64, Ubuntu 20.10 x86_64, Ubuntu 22.04 x86_64, Ubuntu 24.04 x86_64, Ubuntu 24.04.3 x86_64, CentOS 8.x, AlmaLinux 8.x, AlmaLinux 9.x, AlmaLinux 10.x and CloudLinux 7.x...\n"
     exit
 fi
 
@@ -265,18 +547,22 @@ elif grep -q "AlmaLinux-8" /etc/os-release ; then
   Server_OS="AlmaLinux"
 elif grep -q "AlmaLinux-9" /etc/os-release ; then
   Server_OS="AlmaLinux"
+elif grep -q "AlmaLinux-10" /etc/os-release ; then
+  Server_OS="AlmaLinux"
 elif grep -q -E "CloudLinux 7|CloudLinux 8" /etc/os-release ; then
   Server_OS="CloudLinux"
 elif grep -q -E "Rocky Linux" /etc/os-release ; then
   Server_OS="RockyLinux"
-elif grep -q -E "Ubuntu 18.04|Ubuntu 20.04|Ubuntu 20.10|Ubuntu 22.04" /etc/os-release ; then
+elif grep -q -E "Ubuntu 18.04|Ubuntu 20.04|Ubuntu 20.10|Ubuntu 22.04|Ubuntu 24.04" /etc/os-release ; then
   Server_OS="Ubuntu"
+elif grep -q -E "Debian GNU/Linux 11|Debian GNU/Linux 12|Debian GNU/Linux 13" /etc/os-release ; then
+  Server_OS="Debian"
 elif grep -q -E "openEuler 20.03|openEuler 22.03" /etc/os-release ; then
   Server_OS="openEuler"
 else
   echo -e "Unable to detect your system..."
-  echo -e "\nCyberPanel is supported on x86_64 based Ubuntu 18.04, Ubuntu 20.04, Ubuntu 20.10, Ubuntu 22.04, CentOS 7, CentOS 8, CentOS 9, RHEL 8, RHEL 9, AlmaLinux 8, AlmaLinux 9, RockyLinux 8, CloudLinux 7, CloudLinux 8, openEuler 20.03, openEuler 22.03...\n"
-  Debug_Log2 "CyberPanel is supported on x86_64 based Ubuntu 18.04, Ubuntu 20.04, Ubuntu 20.10, Ubuntu 22.04, CentOS 7, CentOS 8, CentOS 9, RHEL 8, RHEL 9, AlmaLinux 8, RockyLinux 8, AlmaLinux 9, CloudLinux 7, CloudLinux 8, openEuler 20.03, openEuler 22.03... [404]"
+  echo -e "\nCyberPanel is supported on x86_64 based Ubuntu 18.04, Ubuntu 20.04, Ubuntu 20.10, Ubuntu 22.04, Ubuntu 24.04, Ubuntu 24.04.3, Debian 11, Debian 12, Debian 13, CentOS 7, CentOS 8, CentOS 9, RHEL 8, RHEL 9, AlmaLinux 8, AlmaLinux 9, AlmaLinux 10, RockyLinux 8, CloudLinux 7, CloudLinux 8, openEuler 20.03, openEuler 22.03...\n"
+  Debug_Log2 "CyberPanel is supported on x86_64 based Ubuntu 18.04, Ubuntu 20.04, Ubuntu 20.10, Ubuntu 22.04, Ubuntu 24.04, Ubuntu 24.04.3, Debian 11, Debian 12, Debian 13, CentOS 7, CentOS 8, CentOS 9, RHEL 8, RHEL 9, AlmaLinux 8, AlmaLinux 9, AlmaLinux 10, RockyLinux 8, CloudLinux 7, CloudLinux 8, openEuler 20.03, openEuler 22.03... [404]"
   exit
 fi
 
@@ -284,21 +570,28 @@ Server_OS_Version=$(grep VERSION_ID /etc/os-release | awk -F[=,] '{print $2}' | 
 #to make 20.04 display as 20, etc.
 
 echo -e "System: $Server_OS $Server_OS_Version detected...\n"
+log_info "Operating system detected: $Server_OS $Server_OS_Version"
 
 if [[ $Server_OS = "CloudLinux" ]] || [[ "$Server_OS" = "AlmaLinux" ]] || [[ "$Server_OS" = "RockyLinux" ]] || [[ "$Server_OS" = "RedHat" ]] ; then
   Server_OS="CentOS"
   #CloudLinux gives version id like 7.8, 7.9, so cut it to show first number only
   #treat CloudLinux, Rocky and Alma as CentOS
+elif [[ "$Server_OS" = "Debian" ]] ; then
+  Server_OS="Ubuntu"
+  #Treat Debian as Ubuntu for package management (both use apt-get)
 fi
 
 if [[ "$Debug" = "On" ]] ; then
   Debug_Log "Server_OS" "$Server_OS $Server_OS_Version"
 fi
 
+log_function_end "Check_OS"
 }
 
 Check_Virtualization() {
+log_function_start "Check_Virtualization"
 echo -e "Checking virtualization type..."
+log_info "Checking virtualization type"
 #if hostnamectl | grep -q "Virtualization: lxc"; then
 #  echo -e "\nLXC detected..."
 #  echo -e "CyberPanel does not support LXC"
@@ -310,6 +603,7 @@ echo -e "Checking virtualization type..."
 
 if hostnamectl | grep -q "Virtualization: openvz"; then
   echo -e "OpenVZ detected...\n"
+  log_info "OpenVZ virtualization detected - applying specific configurations"
 
   if [[ ! -d /etc/systemd/system/pure-ftpd.service.d ]]; then
     mkdir /etc/systemd/system/pure-ftpd.service.d
@@ -339,6 +633,8 @@ fi
 }
 
 Check_Panel() {
+log_function_start "Check_Panel"
+log_info "Checking for existing control panels"
 if [[ -d /usr/local/cpanel ]]; then
   echo -e "\ncPanel detected...\n"
   Debug_Log2 "cPanel detected...exit... [404]"
@@ -359,33 +655,25 @@ fi
 }
 
 Check_Process() {
-if systemctl is-active --quiet httpd; then
-    systemctl disable httpd
-    systemctl stop httpd
-    systemctl mask httpd
-    echo -e "\nhttpd process detected, disabling...\n"
-fi
-if systemctl is-active --quiet apache2; then
-    systemctl disable apache2
-    systemctl stop apache2
-    systemctl mask apache2
-    echo -e "\napache2 process detected, disabling...\n"
-fi
-if systemctl is-active --quiet named; then
-    systemctl stop named
-    systemctl disable named
-    systemctl mask named
-    echo -e "\nnamed process detected, disabling...\n"
-fi
-if systemctl is-active --quiet exim; then
-    systemctl stop exim
-    systemctl disable exim
-    systemctl mask exim
-    echo -e "\nexim process detected, disabling...\n"
-fi
+    log_function_start "Check_Process"
+    log_info "Checking for conflicting processes"
+    local services=("httpd" "apache2" "named" "exim")
+
+    for service in "${services[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            manage_service "$service" "stop"
+            manage_service "$service" "disable"
+            manage_service "$service" "mask"
+            echo -e "\n$service process detected, disabling...\n"
+            log_warning "$service process detected and disabled"
+        fi
+    done
+    log_function_end "Check_Process"
 }
 
 Check_Provider() {
+log_function_start "Check_Provider"
+log_info "Detecting server provider"
 if hash dmidecode >/dev/null 2>&1; then
   if [[ "$(dmidecode -s bios-vendor)" = "Google" ]]; then
     Server_Provider="Google Cloud Platform"
@@ -441,6 +729,7 @@ echo -e "\nThis will install LiteSpeed Enterise , replace LICENSE_KEY to actual 
 }
 
 Check_Argument() {
+log_function_start "Check_Argument" "$@"
 if  [[ "$#" = "0" ]] || [[ "$#" = "1" && "$1" = "--debug" ]] || [[ "$#" = "1" && "$1" = "--mirror" ]]; then
   echo -e "\nInitialized...\n"
 else
@@ -830,17 +1119,31 @@ License_Check "$License_Key"
 }
 
 Pre_Install_Setup_Repository() {
+log_function_start "Pre_Install_Setup_Repository"
+log_info "Setting up package repositories for $Server_OS $Server_OS_Version"
 if [[ $Server_OS = "CentOS" ]] ; then
-  rpm --import https://cyberpanel.sh/rpms.litespeedtech.com/centos/RPM-GPG-KEY-litespeed
-  #import the LiteSpeed GPG key
+  log_debug "Importing LiteSpeed GPG key"
+  # Import LiteSpeed GPG key with fallback
+  rpm --import https://cyberpanel.sh/rpms.litespeedtech.com/centos/RPM-GPG-KEY-litespeed || {
+    warning "Primary GPG key import failed, trying alternative source"
+    rpm --import https://rpms.litespeedtech.com/centos/RPM-GPG-KEY-litespeed || {
+      error "Failed to import LiteSpeed GPG key from all sources"
+      return 1
+    }
+  }
 
   yum clean all
   yum autoremove -y epel-release
   rm -f /etc/yum.repos.d/epel.repo
   rm -f /etc/yum.repos.d/epel.repo.rpmsave
 
-  if [[ "$Server_OS_Version" = "9" ]]; then
+  # Setup EPEL repository based on version
+  setup_epel_repo
 
+  # Setup MariaDB repository
+  setup_mariadb_repo
+
+  if [[ "$Server_OS_Version" = "9" ]] || [[ "$Server_OS_Version" = "10" ]]; then
     # Check if architecture is aarch64
     if uname -m | grep -q 'aarch64' ; then
       # Run the following commands if architecture is aarch64
@@ -857,37 +1160,20 @@ if [[ $Server_OS = "CentOS" ]] ; then
       dnf config-manager --set-enabled crb > /dev/null 2>&1
     else
       # enable codeready-builder repo for Other RHEL Based OS
-      subscription-manager repos --enable codeready-builder-for-rhel-9-$(arch)-rpms > /dev/null 2>&1
+      dnf config-manager --set-enabled crb
     fi
 
-    yum install -y https://cyberpanel.sh/dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    # Install appropriate remi-release based on version
+    if [[ "$Server_OS_Version" = "9" ]]; then
+      yum install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm
+    elif [[ "$Server_OS_Version" = "10" ]]; then
+      yum install -y https://rpms.remirepo.net/enterprise/remi-release-10.rpm
+    fi
       Check_Return "yum repo" "no_exit"
-    yum install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm
-      Check_Return "yum repo" "no_exit"
-    #!/bin/bash
-
-# Check if architecture is x86_64
-if uname -m | grep -q 'x86_64' ; then
-  # Create the MariaDB repository configuration file for x86_64 architecture
-  cat <<EOF >/etc/yum.repos.d/MariaDB.repo
-# MariaDB 10.11 CentOS repository list - created 2021-08-06 02:01 UTC
-# http://downloads.mariadb.org/mariadb/repositories/
-[mariadb]
-name = MariaDB
-baseurl = http://yum.mariadb.org/10.11/rhel9-amd64/
-gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
-enabled=1
-gpgcheck=1
-EOF
-  echo "MariaDB repository file created for x86_64 architecture."
-fi
   fi
 
   if [[ "$Server_OS_Version" = "8" ]]; then
     rpm --import https://cyberpanel.sh/www.centos.org/keys/RPM-GPG-KEY-CentOS-Official
-    rpm --import https://cyberpanel.sh/dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-8
-    yum install -y https://cyberpanel.sh/dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
-      Check_Return "yum repo" "no_exit"
 
     sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-* > /dev/null 2>&1
     sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-* > /dev/null 2>&1
@@ -896,7 +1182,7 @@ fi
     dnf config-manager --set-enabled PowerTools > /dev/null 2>&1
     dnf config-manager --set-enabled powertools > /dev/null 2>&1
 
-  
+
 #    cat <<EOF >/etc/yum.repos.d/CentOS-PowerTools-CyberPanel.repo
 #[powertools-for-cyberpanel]
 #name=CentOS Linux \$releasever - PowerTools
@@ -932,7 +1218,7 @@ gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
 gpgcheck=1
 EOF
 
-    yum install --nogpg -y https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/gf-release-latest.gf.el7.noarch.rpm
+    yum install --nogpg -y https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/gf-release-latest.gf.el7.noarch.rpm
       Check_Return "yum repo" "no_exit"
 
     rpm -ivh https://cyberpanel.sh/repo.iotti.biz/CentOS/7/noarch/lux-release-7-1.noarch.rpm
@@ -944,6 +1230,7 @@ EOF
 fi
 
 if [[ $Server_OS = "openEuler" ]]; then
+  log_debug "Importing LiteSpeed GPG key"
   rpm --import https://cyberpanel.sh/rpms.litespeedtech.com/centos/RPM-GPG-KEY-litespeed
   #import the LiteSpeed GPG key
   yum clean all
@@ -1014,8 +1301,8 @@ if [[ "$Server_OS" = "CentOS" ]] && [[ "$Server_OS_Version" = "7" ]]; then
 
   sed -i 's|http://repo.iotti.biz|https://cyberpanel.sh/repo.iotti.biz|g' /etc/yum.repos.d/frank.repo
 
-  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/7/gf/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/el/7/gf/x86_64/|g" /etc/yum.repos.d/gf.repo
-  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/7/plus/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/el/7/plus/x86_64/|g" /etc/yum.repos.d/gf.repo
+  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/7/gf/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/el/7/gf/x86_64/|g" /etc/yum.repos.d/gf.repo
+  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/7/plus/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/el/7/plus/x86_64/|g" /etc/yum.repos.d/gf.repo
 
   sed -i 's|https://repo.ius.io|https://cyberpanel.sh/repo.ius.io|g' /etc/yum.repos.d/ius.repo
 
@@ -1032,7 +1319,7 @@ Debug_Log2 "Setting up repositories for CN server...,1"
 Download_Requirement() {
 for i in {1..50} ;
   do
-  if [[ "$Server_OS_Version" = "22" ]] || [[ "$Server_OS_Version" = "9" ]]; then
+  if [[ "$Server_OS_Version" = "22" ]] || [[ "$Server_OS_Version" = "24" ]] || [[ "$Server_OS_Version" = "9" ]] || [[ "$Server_OS_Version" = "10" ]]; then
    wget -O /usr/local/requirments.txt "${Git_Content_URL}/${Branch_Name}/requirments.txt"
   else
    wget -O /usr/local/requirments.txt "${Git_Content_URL}/${Branch_Name}/requirments-old.txt"
@@ -1042,18 +1329,21 @@ for i in {1..50} ;
     break
   else
     echo -e "\n Requirement list has failed to download for $i times..."
-    echo -e "Wait for 30 seconds and try again...\n"
-    sleep 30
+    echo -e "Wait for 5 seconds and try again...\n"
+    sleep 5
   fi
 done
 #special made function for Gitee.com , for whatever reason , sometimes it fails to download this file
 }
 
 Pre_Install_Required_Components() {
-
+log_function_start "Pre_Install_Required_Components"
 Debug_Log2 "Installing necessary components..,3"
+log_info "Installing required system components and dependencies"
 
 if [[ "$Server_OS" = "CentOS" ]] || [[ "$Server_OS" = "openEuler" ]] ; then
+  # System-wide update - consider making this optional for faster installs
+  # Could add a --skip-system-update flag to bypass this
   yum update -y
   if [[ "$Server_OS_Version" = "7" ]] ; then
     yum install -y wget strace net-tools curl which bc telnet htop libevent-devel gcc libattr-devel xz-devel gpgme-devel curl-devel git socat openssl-devel MariaDB-shared mariadb-devel yum-utils python36u python36u-pip python36u-devel zip unzip bind-utils
@@ -1061,32 +1351,45 @@ if [[ "$Server_OS" = "CentOS" ]] || [[ "$Server_OS" = "openEuler" ]] ; then
     yum -y groupinstall development
       Check_Return
   elif [[ "$Server_OS_Version" = "8" ]] ; then
-    dnf install -y libnsl zip wget strace net-tools curl which bc telnet htop libevent-devel gcc libattr-devel xz-devel mariadb-devel curl-devel git platform-python-devel tar socat python3 zip unzip bind-utils
+    dnf install -y libnsl zip wget strace net-tools curl which bc telnet htop libevent-devel gcc libattr-devel xz-devel mariadb-devel curl-devel git platform-python-devel tar socat python3 zip unzip bind-utils gpgme-devel
       Check_Return
-    dnf install -y gpgme-devel
-      Check_Return
-  elif [[ "$Server_OS_Version" = "9" ]] ; then
+  elif [[ "$Server_OS_Version" = "9" ]] || [[ "$Server_OS_Version" = "10" ]] ; then
 
     #!/bin/bash
 
 
-    dnf install -y libnsl zip wget strace net-tools curl which bc telnet htop libevent-devel gcc libattr-devel xz-devel MariaDB-server MariaDB-client MariaDB-devel curl-devel git platform-python-devel tar socat python3 zip unzip bind-utils gpgme-devel openssl-devel
+    dnf install -y libnsl zip wget strace net-tools curl which bc telnet htop libevent-devel gcc libattr-devel xz-devel MariaDB-server MariaDB-client MariaDB-devel curl-devel git platform-python-devel tar socat python3 zip unzip bind-utils gpgme-devel openssl-devel boost-devel boost-program-options
       Check_Return
-  elif [[ "$Server_OS_Version" = "20" ]] || [[ "$Server_OS_Version" = "22" ]] ; then
-    dnf install -y libnsl zip wget strace net-tools curl which bc telnet htop libevent-devel gcc libattr-devel xz-devel mariadb-devel curl-devel git python3-devel tar socat python3 zip unzip bind-utils
-      Check_Return
-    dnf install -y gpgme-devel
+    
+    # Fix boost library compatibility for galera-4 on AlmaLinux 10
+    if [[ "$Server_OS_Version" = "10" ]]; then
+      # Create symlink for boost libraries if needed
+      if [ ! -f /usr/lib64/libboost_program_options.so.1.75.0 ]; then
+        BOOST_VERSION=$(find /usr/lib64 -name "libboost_program_options.so.*" | head -1 | sed 's/.*libboost_program_options\.so\.//')
+        if [ -n "$BOOST_VERSION" ]; then
+          ln -sf /usr/lib64/libboost_program_options.so.$BOOST_VERSION /usr/lib64/libboost_program_options.so.1.75.0
+          log_info "Created boost library symlink for galera-4 compatibility: $BOOST_VERSION -> 1.75.0"
+        else
+          warning "Could not find boost libraries, galera-4 may not work properly"
+        fi
+      fi
+    fi
+  elif [[ "$Server_OS_Version" = "20" ]] || [[ "$Server_OS_Version" = "22" ]] || [[ "$Server_OS_Version" = "24" ]] ; then
+    dnf install -y libnsl zip wget strace net-tools curl which bc telnet htop libevent-devel gcc libattr-devel xz-devel mariadb-devel curl-devel git python3-devel tar socat python3 zip unzip bind-utils gpgme-devel
       Check_Return
   fi
   ln -s /usr/bin/pip3 /usr/bin/pip
 else
+  # Update package lists (required for installations)
   apt update -y
+  # System-wide upgrade - consider making this optional for faster installs
+  # Could add a --skip-system-upgrade flag to bypass this
   DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 	if [[ "$Server_Provider" = "Alibaba Cloud" ]] ; then
     apt install -y --allow-downgrades libgnutls30=3.6.13-2ubuntu1.3
   fi
 
-  if [[ "$Server_OS_Version" = "22" ]] ; then
+  if [[ "$Server_OS_Version" = "22" ]] || [[ "$Server_OS_Version" = "24" ]] ; then
     DEBIAN_FRONTEND=noninteractive apt install -y dnsutils net-tools htop telnet libcurl4-gnutls-dev libgnutls28-dev libgcrypt20-dev libattr1 libattr1-dev liblzma-dev libgpgme-dev libcurl4-gnutls-dev libssl-dev nghttp2 libnghttp2-dev idn2 libidn2-dev libidn2-0-dev librtmp-dev libpsl-dev nettle-dev libgnutls28-dev libldap2-dev libgssapi-krb5-2 libk5crypto3 libkrb5-dev libcomerr2 libldap2-dev virtualenv git socat vim unzip zip libmariadb-dev-compat libmariadb-dev
      Check_Return
   else
@@ -1094,20 +1397,12 @@ else
      Check_Return
   fi
 
-  DEBIAN_FRONTEND=noninteractive apt install -y python3-pip
+  DEBIAN_FRONTEND=noninteractive apt install -y python3-pip build-essential libssl-dev libffi-dev python3-dev python3-venv cron inetutils-ping
     Check_Return
 
   ln -s /usr/bin/pip3 /usr/bin/pip3.6
   ln -s /usr/bin/pip3.6 /usr/bin/pip
-
-  DEBIAN_FRONTEND=noninteractive apt install -y build-essential libssl-dev libffi-dev python3-dev
-    Check_Return
-  DEBIAN_FRONTEND=noninteractive apt install -y python3-venv
-    Check_Return
-
-  DEBIAN_FRONTEND=noninteractive apt install -y cron inetutils-ping
-    Check_Return
-# Oracle Ubuntu ARM misses ping and cron 
+# Oracle Ubuntu ARM misses ping and cron
 
   DEBIAN_FRONTEND=noninteractive apt install -y locales
   locale-gen "en_US.UTF-8"
@@ -1120,16 +1415,51 @@ export LC_CTYPE=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 #need to set lang to address some pip module installation issue.
 
-Retry_Command "pip install --default-timeout=3600 virtualenv"
+# Install virtualenv - handle Ubuntu 24.04's externally-managed-environment policy
+if [[ "$Server_OS" = "Ubuntu" ]]; then
+  if [[ "$Server_OS_Version" = "24" ]]; then
+    # Ubuntu 24.04 has python3-venv by default, no need to install virtualenv
+    echo -e "Ubuntu 24.04 detected - using built-in python3-venv"
+  else
+    # For older Ubuntu versions, install virtualenv via apt
+    Retry_Command "DEBIAN_FRONTEND=noninteractive apt-get update"
+    Retry_Command "DEBIAN_FRONTEND=noninteractive apt-get install -y python3-virtualenv"
+  fi
+else
+  # For non-Ubuntu systems, use pip (may need --break-system-packages on newer systems)
+  Retry_Command "pip install --default-timeout=3600 virtualenv"
+fi
 
 Download_Requirement
 
-if [[ "$Server_OS" = "Ubuntu" ]] && [[ "$Server_OS_Version" = "22" ]] ; then
-python3 -m venv /usr/local/CyberPanel
-Check_Return
+echo -e "Creating CyberPanel virtual environment..."
+
+# First ensure the directory exists
+mkdir -p /usr/local/CyberPanel
+
+if [[ "$Server_OS" = "Ubuntu" ]] && ([[ "$Server_OS_Version" = "22" ]] || [[ "$Server_OS_Version" = "24" ]]) ; then
+  echo -e "Ubuntu 22.04/24.04 detected, using python3 -m venv..."
+  if python3 -m venv /usr/local/CyberPanel 2>&1; then
+    echo -e "Virtual environment created successfully"
+  else
+    echo -e "python3 -m venv failed, trying virtualenv..."
+    # For Ubuntu 24.04, python3-venv should work, but if not, try apt install
+    if [[ "$Server_OS_Version" = "24" ]]; then
+      Retry_Command "DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv"
+    else
+      # For Ubuntu 22.04, install virtualenv via apt
+      Retry_Command "DEBIAN_FRONTEND=noninteractive apt-get install -y python3-virtualenv"
+    fi
+    virtualenv -p /usr/bin/python3 /usr/local/CyberPanel
+  fi
 else
-virtualenv -p /usr/bin/python3 /usr/local/CyberPanel
-  Check_Return
+  virtualenv -p /usr/bin/python3 /usr/local/CyberPanel
+fi
+
+# Verify virtual environment was created
+if [[ ! -f /usr/local/CyberPanel/bin/activate ]]; then
+  echo -e "ERROR: Virtual environment creation failed!"
+  exit 1
 fi
 
 if [ "$Server_OS" = "Ubuntu" ]; then
@@ -1144,10 +1474,6 @@ Debug_Log2 "Installing requirments..,3"
 
 Retry_Command "pip install --default-timeout=3600 -r /usr/local/requirments.txt"
   Check_Return "requirments" "no_exit"
-
-if [[ "$Server_OS" = "Ubuntu" ]] && [[ "$Server_OS_Version" = "22" ]] ; then
-  cp /usr/bin/python3.10 /usr/local/CyberCP/bin/python3
-fi
 
 rm -rf cyberpanel
 echo -e "\nFetching files from ${Git_Clone_URL}...\n"
@@ -1170,7 +1496,9 @@ Debug_Log2 "Necessary components installed..,5"
 }
 
 Pre_Install_System_Tweak() {
+log_function_start "Pre_Install_System_Tweak"
 Debug_Log2 "Setting up system tweak...,20"
+log_info "Applying system tweaks and optimizations"
 Line_Number=$(grep -n "127.0.0.1" /etc/hosts | cut -d: -f 1)
 My_Hostname=$(hostname)
 
@@ -1225,11 +1553,11 @@ if ! grep -q "pid_max" /etc/rc.local 2>/dev/null ; then
     echo 1 > /sys/kernel/mm/ksm/run" >>/etc/rc.d/rc.local
     chmod +x /etc/rc.d/rc.local
   else
-    if [[ -f /etc/rc.local ]] ; then 
+    if [[ -f /etc/rc.local ]] ; then
       echo -e "#!/bin/bash\n$(cat /etc/rc.local)" > /etc/rc.local
-    else 
+    else
       echo "#!/bin/bash" > /etc/rc.local
-    fi 
+    fi
     echo "echo 1000000 > /proc/sys/kernel/pid_max
     echo 1 > /sys/kernel/mm/ksm/run" >>/etc/rc.local
     chmod +x /etc/rc.local
@@ -1311,8 +1639,14 @@ if ! grep -q "pid_max" /etc/rc.local 2>/dev/null ; then
   fi
 
   systemctl restart systemd-networkd >/dev/null 2>&1
-  sleep 3
-  #take a break ,or installer will break
+  # Wait for network to come up, but check more frequently
+  for j in {1..6}; do
+    sleep 0.5
+    # Check if network is ready by trying to resolve DNS
+    if ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1 || nslookup cyberpanel.sh >/dev/null 2>&1; then
+      break
+    fi
+  done
 
   # Check Connectivity
   if ping -q -c 1 -W 1 cyberpanel.sh >/dev/null; then
@@ -1326,18 +1660,31 @@ if ! grep -q "pid_max" /etc/rc.local 2>/dev/null ; then
     systemctl restart systemd-networkd >/dev/null 2>&1
     echo -e "\nReturns the nameservers settings to default..\n"
     echo -e "\nContinue installation..\n"
-    sleep 3
+    # Brief pause for network stabilization
+    sleep 1
   fi
 
 cp /etc/resolv.conf /etc/resolv.conf-tmp
 
+# Find the line containing nameserver 8.8.8.8 pattern
 Line1="$(grep -n "f.write('nameserver 8.8.8.8')" installCyberPanel.py | head -n 1 | cut -d: -f1)"
-sed -i "${Line1}i\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ subprocess.call\(command, shell=True)" installCyberPanel.py
-sed -i "${Line1}i\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ command = 'cat /etc/resolv.conf-tmp > /etc/resolv.conf'" installCyberPanel.py
+
+# Only modify the file if the pattern was found
+if [[ -n "$Line1" ]] && [[ "$Line1" =~ ^[0-9]+$ ]]; then
+    sed -i "${Line1}i\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ subprocess.call\(command, shell=True)" installCyberPanel.py
+    sed -i "${Line1}i\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ command = 'cat /etc/resolv.conf-tmp > /etc/resolv.conf'" installCyberPanel.py
+else
+    echo "Warning: Could not find 'nameserver 8.8.8.8' pattern in installCyberPanel.py - skipping resolv.conf modification"
+fi
+
+log_debug "System tweaks completed - SWAP, limits, and DNS configured"
+log_function_end "Pre_Install_System_Tweak"
 }
 
 License_Validation() {
+log_function_start "License_Validation"
 Debug_Log2 "Validating LiteSpeed license...,40"
+log_info "Validating LiteSpeed Enterprise license"
 Current_Dir=$(pwd)
 
 if [ -f /root/cyberpanel-tmp ]; then
@@ -1352,7 +1699,8 @@ tar xzvf "lsws-$LSWS_Stable_Version-ent-x86_64-linux.tar.gz" >/dev/null
 cd "/root/cyberpanel-tmp/lsws-$LSWS_Stable_Version/conf"  || exit
 if [[ "$License_Key" = "Trial" ]]; then
   Retry_Command "wget -q https://cyberpanel.sh/license.litespeedtech.com/reseller/trial.key"
-  sed -i "s|writeSerial = open('lsws-6.0/serial.no', 'w')|command = 'wget -q --output-document=./lsws-$LSWS_Stable_Version/trial.key https://cyberpanel.sh/license.litespeedtech.com/reseller/trial.key'|g" "$Current_Dir/installCyberPanel.py"
+  # Update the serial number handling to use trial key
+  sed -i "s|writeSerial = open('lsws-[0-9.]\+/serial.no', 'w')|command = 'wget -q --output-document=./lsws-$LSWS_Stable_Version/trial.key https://cyberpanel.sh/license.litespeedtech.com/reseller/trial.key'|g" "$Current_Dir/installCyberPanel.py"
   sed -i 's|writeSerial.writelines(self.serial)|subprocess.call(command, shell=True)|g' "$Current_Dir/installCyberPanel.py"
   sed -i 's|writeSerial.close()||g' "$Current_Dir/installCyberPanel.py"
 else
@@ -1370,13 +1718,17 @@ fi
 if ./lshttpd -V |& grep "ERROR" || ./lshttpd -V |& grep "expire in 0 days" ; then
   echo -e "\n\nThere appears to be an issue with license , please check above result..."
   Debug_Log2 "There appears to be an issue with LiteSpeed License, make sure you are using correct serial key. [404]"
+  log_error "LiteSpeed license validation failed"
+  log_function_end "License_Validation" 1
   exit
 fi
 
 echo -e "\nLicense seems valid..."
+log_info "LiteSpeed license validated successfully"
 cd "$Current_Dir" || exit
 rm -rf /root/cyberpanel-tmp
   #clean up the temp files
+log_function_end "License_Validation"
 }
 
 Pre_Install_CN_Replacement() {
@@ -1389,22 +1741,22 @@ fi
 if [[ "$Server_OS" = "CentOS" ]] ; then
   sed -i 's|rpm -ivh http://rpms.litespeedtech.com/centos/litespeed-repo-1.2-1.el7.noarch.rpm|curl -o /etc/yum.repos.d/litespeed.repo https://cyberpanel.sh/litespeed/litespeed_cn.repo|g' install.py
   sed -i 's|rpm -Uvh http://rpms.litespeedtech.com/centos/litespeed-repo-1.1-1.el8.noarch.rpm|curl -o /etc/yum.repos.d/litespeed.repo https://cyberpanel.sh/litespeed/litespeed_cn.repo|g' install.py
-  sed -i 's|https://mirror.ghettoforge.org/distributions|https://cyberpanel.sh/mirror.ghettoforge.org/distributions|g' install.py
+  sed -i 's|https://mirror.ghettoforge.org/distributions|https://cyberpanel.sh/mirror.ghettoforge.net/distributions|g' install.py
 
   if [[ "$Server_OS_Version" = "8" ]] ; then
   sed -i 's|dnf --nogpg install -y https://mirror.ghettoforge.org/distributions/gf/gf-release-latest.gf.el8.noarch.rpm|echo gf8|g' install.py
-  sed -i 's|dnf --nogpg install -y https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/gf-release-latest.gf.el8.noarch.rpm|echo gf8|g' install.py
+  sed -i 's|dnf --nogpg install -y https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/gf-release-latest.gf.el8.noarch.rpm|echo gf8|g' install.py
 
-  Retry_Command "dnf --nogpg install -y https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/gf-release-latest.gf.el8.noarch.rpm"
-  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/gf/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/el/8/gf/x86_64/|g" /etc/yum.repos.d/gf.repo
-  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/plus/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/el/8/plus/x86_64/|g" /etc/yum.repos.d/gf.repo
+  Retry_Command "dnf --nogpg install -y https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/gf-release-latest.gf.el8.noarch.rpm"
+  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/gf/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/el/8/gf/x86_64/|g" /etc/yum.repos.d/gf.repo
+  sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/plus/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/el/8/plus/x86_64/|g" /etc/yum.repos.d/gf.repo
   #get this set up beforehand.
   fi
 
-  if [[ "$Server_OS_Version" = "9" ]] ; then
+  if [[ "$Server_OS_Version" = "9" ]] || [[ "$Server_OS_Version" = "10" ]] ; then
     sed -i 's|rpm -Uvh http://rpms.litespeedtech.com/centos/litespeed-repo-1.1-1.el8.noarch.rpm|curl -o /etc/yum.repos.d/litespeed.repo https://rpms.litespeedtech.com/centos/litespeed.repo|g' install.py
-    sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/gf/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/el/9/gf/x86_64/|g" /etc/yum.repos.d/gf.repo
-    sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/plus/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.org/distributions/gf/el/9/plus/x86_64/|g" /etc/yum.repos.d/gf.repo
+    sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/gf/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/el/9/gf/x86_64/|g" /etc/yum.repos.d/gf.repo
+    sed -i "s|mirrorlist=http://mirrorlist.ghettoforge.org/el/8/plus/\$basearch/mirrorlist|baseurl=https://cyberpanel.sh/mirror.ghettoforge.net/distributions/gf/el/9/plus/x86_64/|g" /etc/yum.repos.d/gf.repo
   fi
 fi
 
@@ -1439,7 +1791,9 @@ Retry_Command "/root/.acme.sh/acme.sh --upgrade --auto-upgrade"
 }
 
 Main_Installation() {
+log_function_start "Main_Installation"
 Debug_Log2 "Starting main installation..,30"
+log_info "Starting main CyberPanel installation"
 if [[ -d /usr/local/CyberCP ]] ; then
   echo -e "\n CyberPanel already installed, exiting..."
   Debug_Log2 "CyberPanel already installed, exiting... [404]"
@@ -1526,22 +1880,8 @@ fi
 }
 
 Post_Install_Addon_Mecached_LSMCD() {
-if [[ $Server_OS = "CentOS" ]] || [[ $Server_OS = "openEuler" ]]; then
-  yum groupinstall "Development Tools" -y
-  yum install autoconf automake zlib-devel openssl-devel expat-devel pcre-devel libmemcached-devel cyrus-sasl* -y
-  wget -O lsmcd-master.zip https://cyberpanel.sh/codeload.github.com/litespeedtech/lsmcd/zip/master
-  unzip lsmcd-master.zip
-  Current_Dir=$(pwd)
-  cd "$Current_Dir/lsmcd-master"  || exit
-  ./fixtimestamp.sh
-  ./configure CFLAGS=" -O3" CXXFLAGS=" -O3"
-  make
-  make install
-  systemctl enable lsmcd
-  systemctl start lsmcd
-  cd "$Current_Dir"  || exit
-else
-  DEBIAN_FRONTEND=noninteractive apt install build-essential zlib1g-dev libexpat1-dev openssl libssl-dev libsasl2-dev libpcre3-dev git -y
+  install_dev_tools
+
   wget -O lsmcd-master.zip https://cyberpanel.sh/codeload.github.com/litespeedtech/lsmcd/zip/master
   unzip lsmcd-master.zip
   Current_Dir=$(pwd)
@@ -1551,102 +1891,87 @@ else
   make
   make install
   cd "$Current_Dir"  || exit
-  systemctl enable lsmcd
-  systemctl start lsmcd
-fi
+
+  manage_service "lsmcd" "enable"
+  manage_service "lsmcd" "start"
+  log_info "LSMCD installation completed"
+  log_function_end "Post_Install_Addon_Mecached_LSMCD"
 }
 
 Post_Install_Addon_Memcached() {
-if [[ $Server_OS = "CentOS" ]]; then
-  yum install -y lsphp??-memcached lsphp??-pecl-memcached
-  if [[ $Total_RAM -eq "2048" ]] || [[ $Total_RAM -gt "2048" ]]; then
+  log_function_start "Post_Install_Addon_Memcached"
+  log_info "Installing Memcached and PHP extension"
+  install_php_packages "memcached"
+
+  if [[ $Total_RAM -ge 2048 ]]; then
     Post_Install_Addon_Mecached_LSMCD
   else
-    yum install -y memcached
-    sed -i 's|OPTIONS=""|OPTIONS="-l 127.0.0.1 -U 0"|g' /etc/sysconfig/memcached
-    #turn off UDP and bind to 127.0.0.1 only
-    systemctl enable memcached
-    systemctl start memcached
+    install_package "memcached"
+    configure_memcached
+    manage_service "memcached" "enable"
+    manage_service "memcached" "start"
   fi
-fi
-if [[ $Server_OS = "Ubuntu" ]]; then
-  DEBIAN_FRONTEND=noninteractive apt install -y "lsphp*-memcached"
 
-  if [[ "$Total_RAM" -eq "2048" ]] || [[ "$Total_RAM" -gt "2048" ]]; then
-    Post_Install_Addon_Mecached_LSMCD
-  else
-    DEBIAN_FRONTEND=noninteractive apt install -y memcached
-    systemctl enable memcached
-    systemctl start memcached
+  if pgrep "lsmcd" ; then
+    echo -e "\n\nLiteSpeed Memcached installed and running..."
   fi
-fi
-if [[ $Server_OS = "openEuler" ]]; then
-  yum install -y lsphp??-memcached lsphp??-pecl-memcached
-  if [[ $Total_RAM -eq "2048" ]] || [[ $Total_RAM -gt "2048" ]]; then
-    Post_Install_Addon_Mecached_LSMCD
-  else
-    yum install -y memcached
-    sed -i 's|OPTIONS=""|OPTIONS="-l 127.0.0.1 -U 0"|g' /etc/sysconfig/memcached
-    #turn off UDP and bind to 127.0.0.1 only
-    systemctl enable memcached
-    systemctl start memcached
+
+  if pgrep "memcached" ; then
+    echo -e "\n\nMemcached installed and running..."
   fi
-fi
-
-if pgrep "lsmcd" ; then
-  echo -e "\n\nLiteSpeed Memcached installed and running..."
-fi
-
-if pgrep "memcached" ; then
-  echo -e "\n\nMemcached installed and running..."
-fi
 }
 
 Post_Install_Addon_Redis() {
-if [[ "$Server_OS" = "CentOS" ]]; then
-  if [[ "$Server_OS_Version" = "8" || "$Server_OS_Version" = "9" ]]; then
-    yum install -y lsphp??-redis redis
-  else
-    yum -y install http://rpms.remirepo.net/enterprise/remi-release-7.rpm
-    yum-config-manager --disable remi
-    yum-config-manager --disable remi-safe
-    yum -y --enablerepo=remi install redis
+  log_function_start "Post_Install_Addon_Redis"
+  log_info "Installing Redis server and PHP extension"
+  # Install PHP Redis extension
+  install_php_packages "redis"
+
+  # Install Redis server
+  if [[ "$Server_OS" = "CentOS" ]]; then
+    if [[ "$Server_OS_Version" = "8" || "$Server_OS_Version" = "9" || "$Server_OS_Version" = "10" ]]; then
+      install_package "redis"
+    else
+      yum -y install http://rpms.remirepo.net/enterprise/remi-release-7.rpm
+      yum-config-manager --disable remi
+      yum-config-manager --disable remi-safe
+      yum -y --enablerepo=remi install redis
+    fi
+  elif [[ "$Server_OS" = "Ubuntu" ]]; then
+    install_package "redis"
+  elif [[ "$Server_OS" = "openEuler" ]]; then
+    install_package "redis6"
   fi
-fi
 
-if [[ $Server_OS = "Ubuntu" ]]; then
-  DEBIAN_FRONTEND=noninteractive apt install -y "lsphp*-redis" redis
-fi
+  # Configure Redis for IPv6
+  if ifconfig -a | grep inet6; then
+    echo -e "\nIPv6 detected...\n"
+  else
+    sed -i 's|bind 127.0.0.1 ::1|bind 127.0.0.1|g' /etc/redis/redis.conf
+    echo -e "\n no IPv6 detected..."
+  fi
 
-if ifconfig -a | grep inet6; then
-  echo -e "\nIPv6 detected...\n"
-else
-  sed -i 's|bind 127.0.0.1 ::1|bind 127.0.0.1|g' /etc/redis/redis.conf
-  echo -e "\n no IPv6 detected..."
-fi
+  # Start Redis service
+  if [[ $Server_OS = "Ubuntu" ]]; then
+    manage_service "redis-server" "stop"
+    rm -f /var/run/redis/redis-server.pid
+    manage_service "redis-server" "enable"
+    manage_service "redis-server" "start"
+  else
+    manage_service "redis" "enable"
+    manage_service "redis" "start"
+  fi
 
-if [[ $Server_OS = "Ubuntu" ]]; then
-  systemctl stop redis-server
-  rm -f /var/run/redis/redis-server.pid
-  systemctl enable redis-server
-  systemctl start redis-server
-else
-  systemctl enable redis
-  systemctl start redis
-fi
-
-if [[ "$Server_OS" = "openEuler" ]]; then
-  yum install -y lsphp??-redis redis6
-fi
-
-if pgrep "redis" ; then
-  echo -e "\n\nRedis installed and running..."
-  touch /home/cyberpanel/redis
-fi
+  if pgrep "redis" ; then
+    echo -e "\n\nRedis installed and running..."
+    touch /home/cyberpanel/redis
+  fi
 }
 
 Post_Install_PHP_Session_Setup() {
+log_function_start "Post_Install_PHP_Session_Setup"
 echo -e "\nSetting up PHP session storage path...\n"
+log_info "Setting up PHP session storage configuration"
 #wget -O /root/php_session_script.sh "${Git_Content_URL}/stable/CPScripts/setup_php_sessions.sh"
 chmod +x /usr/local/CyberCP/CPScripts/setup_php_sessions.sh
 bash /usr/local/CyberCP/CPScripts/setup_php_sessions.sh
@@ -1655,58 +1980,58 @@ Debug_Log2 "Setting up PHP session conf...,90"
 }
 
 Post_Install_PHP_TimezoneDB() {
+log_function_start "Post_Install_PHP_TimezoneDB"
+log_info "Installing PHP TimezoneDB extension"
 Current_Dir="$(pwd)"
 rm -f /usr/local/lsws/cyberpanel-tmp
 mkdir /usr/local/lsws/cyberpanel-tmp
 cd /usr/local/lsws/cyberpanel-tmp || exit
-wget -O timezonedb.tgz https://cyberpanel.sh/pecl.php.net/get/timezonedb
-tar xzvf timezonedb.tgz
-cd timezonedb-*  || exit
 
-if [[ "$Server_OS" = "Ubuntu" ]] ; then
-  DEBIAN_FRONTEND=noninteractive apt install libmagickwand-dev pkg-config build-essential -y
-  DEBIAN_FRONTEND=noninteractive apt install -y lsphp*-dev
-else
-  yum remove -y lsphp??-mysql
-  yum install -y lsphp??-mysqlnd
-  yum install -y lsphp??-devel make gcc glibc-devel libmemcached-devel zlib-devel
+# Try to download timezonedb, but continue if it fails
+wget -O timezonedb.tgz https://cyberpanel.sh/pecl.php.net/get/timezonedb
+if [ ! -f timezonedb.tgz ] || [ ! -s timezonedb.tgz ]; then
+    log_info "WARNING: Failed to download timezonedb, skipping installation"
+    cd "$Current_Dir" || exit
+    rm -rf /usr/local/lsws/cyberpanel-tmp
+    return 0
 fi
 
-for PHP_Version in /usr/local/lsws/lsphp?? ;
-  do
-    PHP_INI_Path=$(find "$PHP_Version" -name php.ini)
+tar xzvf timezonedb.tgz
+if [ ! -d timezonedb-* ]; then
+    log_info "WARNING: Failed to extract timezonedb, skipping installation"
+    cd "$Current_Dir" || exit
+    rm -rf /usr/local/lsws/cyberpanel-tmp
+    return 0
+fi
 
-    if [[ "$Server_OS" = "CentOS" ]] || [[ "$Server_OS" = "openEuler" ]]; then
-      if [[ ! -d "${PHP_Version}/tmp" ]]; then
-        mkdir "${PHP_Version}/tmp"
-      fi
-      "${PHP_Version}"/bin/pecl channel-update pecl.php.net
-      "${PHP_Version}"/bin/pear config-set temp_dir "${PHP_Version}/tmp"
-      "${PHP_Version}"/bin/phpize
-      ./configure --with-php-config="${PHP_Version}"/bin/php-config
-      make
-      make install
-      echo "extension=timezonedb.so" > "${PHP_Version}/etc/php.d/20-timezone.ini"
-      make clean
-      sed -i 's|expose_php = On|expose_php = Off|g' "$PHP_INI_Path"
-      sed -i 's|mail.add_x_header = On|mail.add_x_header = Off|g' "$PHP_INI_Path"
-    else
-      "${PHP_Version}"/bin/phpize
-      ./configure --with-php-config="${PHP_Version}"/bin/php-config
-      make
-      make install
-      echo "extension=timezonedb.so" > "/usr/local/lsws/${PHP_Version: 16:7}/etc/php/${PHP_Version: 21:1}.${PHP_Version: 22:1}/mods-available/20-timezone.ini"
-      make clean
-      sed -i 's|expose_php = On|expose_php = Off|g' "$PHP_INI_Path"
-      sed -i 's|mail.add_x_header = On|mail.add_x_header = Off|g' "$PHP_INI_Path"
-    fi
-  done
+cd timezonedb-* || {
+    log_info "WARNING: Cannot enter timezonedb directory, skipping installation"
+    cd "$Current_Dir" || exit
+    rm -rf /usr/local/lsws/cyberpanel-tmp
+    return 0
+}
+
+# Install required packages for building PHP extensions
+if [[ "$Server_OS" = "Ubuntu" ]] ; then
+  install_package "libmagickwand-dev pkg-config build-essential lsphp*-dev"
+else
+  install_package "lsphp??-mysqlnd lsphp??-devel make gcc glibc-devel libmemcached-devel zlib-devel"
+  yum remove -y lsphp??-mysql
+fi
+
+# Configure timezone extension for each PHP version
+for PHP_Version in /usr/local/lsws/lsphp?? ; do
+    configure_php_timezone "$PHP_Version"
+done
+
 rm -rf /usr/local/lsws/cyberpanel-tmp
 cd "$Current_Dir" || exit
 Debug_Log2 "Installing timezoneDB...,95"
 }
 
 Post_Install_Regenerate_Webadmin_Console_Passwd() {
+log_function_start "Post_Install_Regenerate_Webadmin_Console_Passwd"
+log_info "Regenerating WebAdmin console password"
 if [[ "$Server_Edition" = "OLS" ]]; then
   PHP_Command="admin_php"
 else
@@ -1725,10 +2050,14 @@ chown lsadm:lsadm /usr/local/lsws/admin/conf/htpasswd
 chmod 600 /usr/local/lsws/admin/conf/htpasswd
 echo "${Webadmin_Pass}" >/etc/cyberpanel/webadmin_passwd
 chmod 600 /etc/cyberpanel/webadmin_passwd
+log_info "WebAdmin console password regenerated"
+log_function_end "Post_Install_Regenerate_Webadmin_Console_Passwd"
 }
 
 Post_Install_Setup_Watchdog() {
+log_function_start "Post_Install_Setup_Watchdog"
 if [[ "$Watchdog" = "On" ]]; then
+  log_info "Setting up watchdog monitoring service"
   wget -O /etc/cyberpanel/watchdog.sh "${Git_Content_URL}/stable/CPScripts/watchdog.sh"
   chmod 700 /etc/cyberpanel/watchdog.sh
   ln -s /etc/cyberpanel/watchdog.sh /usr/local/bin/watchdog
@@ -1763,6 +2092,8 @@ fi
 }
 
 Post_Install_Display_Final_Info() {
+log_function_start "Post_Install_Display_Final_Info"
+log_info "Preparing final installation information"
 snappymailAdminPass=$(grep SetPassword /usr/local/CyberCP/public/snappymail.php| sed -e 's|$oConfig->SetPassword(||g' -e "s|');||g" -e "s|'||g")
 Elapsed_Time="$((Time_Count / 3600)) hrs $(((SECONDS / 60) % 60)) min $((Time_Count % 60)) sec"
 echo "###################################################################"
@@ -1795,7 +2126,7 @@ echo -e "             Run \e[31mcyberpanel utility\e[39m to access some handy to
 echo "                                                                   "
 echo "              Website : https://www.cyberpanel.net                 "
 echo "              Forums  : https://forums.cyberpanel.net              "
-echo "              Wikipage: https://docs.cyberpanel.net                "
+echo "              Wikipage: https://cyberpanel.net/KnowledgeBase/                "
 echo "              Docs    : https://cyberpanel.net/docs/               "
 echo "                                                                   "
 echo -e "            Enjoy your accelerated Internet by                  "
@@ -1834,6 +2165,8 @@ fi
 
 
 Post_Install_Regenerate_Cert() {
+log_function_start "Post_Install_Regenerate_Cert"
+log_info "Regenerating SSL certificates for control panel"
 cat <<EOF >/root/cyberpanel/cert_conf
 [req]
 prompt=no
@@ -1870,12 +2203,41 @@ rm -f /root/cyberpanel/cert_conf
 Post_Install_Required_Components() {
 Debug_Log2 "Finalization..,80"
 
-if [[ "$Server_OS" = "Ubuntu" ]] && [[ "$Server_OS_Version" = "22" ]] ; then
-python3 -m venv /usr/local/CyberCP
-Check_Return
+echo -e "Creating CyberCP virtual environment..."
+
+# First ensure the directory exists
+mkdir -p /usr/local/CyberCP
+
+if [[ "$Server_OS" = "Ubuntu" ]] && ([[ "$Server_OS_Version" = "22" ]] || [[ "$Server_OS_Version" = "24" ]]) ; then
+  echo -e "Ubuntu 22.04/24.04 detected, using python3 -m venv..."
+  if python3 -m venv /usr/local/CyberCP 2>&1; then
+    echo -e "Virtual environment created successfully"
+  else
+    echo -e "python3 -m venv failed, trying virtualenv..."
+    # Ensure virtualenv is properly installed
+    pip3 install --upgrade virtualenv
+    virtualenv -p /usr/bin/python3 /usr/local/CyberCP
+  fi
+elif [[ "$Server_OS" = "CentOS" ]] && ([[ "$Server_OS_Version" = "9" ]] || [[ "$Server_OS_Version" = "10" ]]) ; then
+  echo -e "AlmaLinux/Rocky Linux 9/10 detected, using python3 -m venv..."
+  if python3 -m venv /usr/local/CyberCP 2>&1; then
+    echo -e "Virtual environment created successfully"
+  else
+    echo -e "python3 -m venv failed, trying virtualenv..."
+    # Ensure virtualenv is properly installed
+    pip3 install --upgrade virtualenv
+    # Find the correct python3 path
+    PYTHON_PATH=$(which python3 2>/dev/null || which python3.9 2>/dev/null || echo "/usr/bin/python3")
+    virtualenv -p "$PYTHON_PATH" /usr/local/CyberCP
+  fi
 else
-virtualenv -p /usr/bin/python3 /usr/local/CyberCP
-  Check_Return
+  virtualenv -p /usr/bin/python3 /usr/local/CyberCP
+fi
+
+# Verify virtual environment was created
+if [[ ! -f /usr/local/CyberCP/bin/activate ]]; then
+  echo -e "ERROR: Virtual environment creation failed!"
+  exit 1
 fi
 
 if [[ "$Server_OS" = "Ubuntu" ]] && [[ "$Server_OS_Version" = "20" ]] ; then
@@ -1892,10 +2254,21 @@ fi
 Retry_Command "pip install --default-timeout=3600 -r /usr/local/requirments.txt"
  Check_Return "requirments.txt" "no_exit"
 
-if [[ "$Server_OS" = "Ubuntu" ]] && [[ "$Server_OS_Version" = "22" ]] ; then
+# Verify Django installation
+echo -e "Verifying Django installation..."
+if ! /usr/local/CyberCP/bin/python -c "import django" 2>/dev/null; then
+  echo -e "WARNING: Django not found, reinstalling requirements..."
+  pip install --upgrade pip setuptools wheel packaging
+  pip install --default-timeout=3600 --ignore-installed -r /usr/local/requirments.txt
+else
+  echo -e "Django is properly installed"
+fi
+
+if [[ "$Server_OS" = "Ubuntu" ]] && ([[ "$Server_OS_Version" = "22" ]] || [[ "$Server_OS_Version" = "24" ]]) ; then
+  # Ubuntu 24.04 ships with Python 3.12, but using 3.10 for compatibility with CyberPanel
   cp /usr/bin/python3.10 /usr/local/CyberCP/bin/python3
 else
-  if [[ "$Server_OS_Version" = "9" ]] || [[ "$Server_OS_Version" = "8" ]] || [[ "$Server_OS_Version" = "20" ]]; then
+  if [[ "$Server_OS_Version" = "9" ]] || [[ "$Server_OS_Version" = "10" ]] || [[ "$Server_OS_Version" = "8" ]] || [[ "$Server_OS_Version" = "20" ]] || [[ "$Server_OS_Version" = "24" ]]; then
     echo "PYTHONHOME=/usr" > /usr/local/lscp/conf/pythonenv.conf
   else
     # Uncomment and use the following lines if necessary for other OS versions
@@ -1927,6 +2300,8 @@ fi
 }
 
 Post_Install_Tweak() {
+log_function_start "Post_Install_Tweak"
+log_info "Applying post-installation tweaks and configurations"
 if [[ -d /etc/pure-ftpd/conf ]]; then
   echo "yes" >/etc/pure-ftpd/conf/ChrootEveryone
   systemctl restart pure-ftpd-mysql
@@ -1954,13 +2329,13 @@ chmod 600 /etc/cyberpanel/adminPass
 /usr/local/CyberPanel/bin/python /usr/local/CyberCP/plogical/adminPass.py --password "$Admin_Pass"
 mkdir -p /etc/opendkim
 
-echo '/usr/local/CyberPanel/bin/python /usr/local/CyberCP/plogical/adminPass.py --password $@' > /usr/bin/adminPass
+echo '/usr/local/CyberPanel/bin/python /usr/local/CyberCP/plogical/adminPass.py --password "$@"' > /usr/bin/adminPass
 echo "systemctl restart lscpd" >> /usr/bin/adminPass
 echo "echo \$@ > /etc/cyberpanel/adminPass" >> /usr/bin/adminPass
 chmod 700 /usr/bin/adminPass
 
 rm -f /usr/bin/php
-ln -s /usr/local/lsws/lsphp80/bin/php /usr/bin/php
+ln -s /usr/local/lsws/lsphp83/bin/php /usr/bin/php
 
 if [[ "$Server_OS" = "CentOS" ]] ; then
 #all centos 7/8 post change goes here
@@ -2037,6 +2412,7 @@ systemctl stop lsws >/dev/null 2>&1
 systemctl start lsws >/dev/null 2>&1
 echo -e "\nFinalizing...\n"
 echo -e "Cleaning up...\n"
+log_info "Cleaning up temporary installation files"
 rm -rf /root/cyberpanel
 
 if [[ "$Server_Country" = "CN" ]] ; then
@@ -2059,6 +2435,11 @@ sed -i 's|http://license.litespeedtech.com/|https://cyberpanel.sh/license.litesp
 }
 
 echo -e "\nInitializing...\n"
+log_info "============================================="
+log_info "CyberPanel installation script started"
+log_info "Script version: $Panel_Version.$Panel_Build"
+log_info "Script arguments: $*"
+log_info "============================================="
 
 if [[ "$*" = *"--debug"* ]] ; then
   Debug="On"

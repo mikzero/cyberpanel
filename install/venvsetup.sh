@@ -884,12 +884,25 @@ if [[ $PROVIDER == "Alibaba Cloud" ]] ; then
 fi
 
 pip install virtualenv
-virtualenv --system-site-packages /usr/local/CyberPanel
+
+# Create virtual environment with fallback for Ubuntu 22.04 compatibility
+echo "Creating CyberPanel virtual environment..."
+if python3 -m venv --system-site-packages /usr/local/CyberPanel 2>&1 | grep -q "unrecognized option"; then
+    # Fallback to virtualenv if python3 -m venv doesn't support --system-site-packages
+    virtualenv --system-site-packages /usr/local/CyberPanel
+elif python3 -m venv --system-site-packages /usr/local/CyberPanel 2>/dev/null; then
+    echo "Virtual environment created successfully using python3 -m venv"
+else
+    # Final fallback to virtualenv
+    virtualenv --system-site-packages /usr/local/CyberPanel
+fi
+
 source /usr/local/CyberPanel/bin/activate
 rm -rf requirements.txt
 wget -O requirements.txt https://raw.githubusercontent.com/usmannasir/cyberpanel/1.8.0/requirments.txt
 pip install --ignore-installed -r requirements.txt
-virtualenv --system-site-packages /usr/local/CyberPanel
+# Install python-dotenv for loading .env file (critical for AlmaLinux 8)
+pip install python-dotenv
 fi
 
 if [[ $DEV == "ON" ]] ; then
@@ -900,6 +913,8 @@ if [[ $DEV == "ON" ]] ; then
 	source /usr/local/CyberPanel/bin/activate
 	wget -O requirements.txt https://raw.githubusercontent.com/usmannasir/cyberpanel/$BRANCH_NAME/requirments.txt
 	pip3.6 install --ignore-installed -r requirements.txt
+	# Install python-dotenv for loading .env file (critical for AlmaLinux 8)
+	pip3.6 install python-dotenv
 fi
 
 if [ -f requirements.txt ] && [ -d cyberpanel ] ; then
@@ -954,6 +969,8 @@ python3.6 -m venv /usr/local/CyberCP
 source /usr/local/CyberCP/bin/activate
 wget -O requirements.txt https://raw.githubusercontent.com/usmannasir/cyberpanel/$BRANCH_NAME/requirments.txt
 pip3.6 install --ignore-installed -r requirements.txt
+# Install python-dotenv for loading .env file (critical for AlmaLinux 8)
+pip3.6 install python-dotenv
 systemctl restart lscpd
 fi
 
@@ -1012,7 +1029,7 @@ echo "$ADMIN_PASS" > /etc/cyberpanel/adminPass
 /usr/local/CyberPanel/bin/python2 /usr/local/CyberCP/plogical/adminPass.py --password $ADMIN_PASS
 systemctl restart lscpd
 systemctl restart lsws
-echo "/usr/local/CyberPanel/bin/python2 /usr/local/CyberCP/plogical/adminPass.py --password \$@" > /usr/bin/adminPass
+echo "/usr/local/CyberPanel/bin/python2 /usr/local/CyberCP/plogical/adminPass.py --password \"\$@\"" > /usr/bin/adminPass
 echo "systemctl restart lscpd" >> /usr/bin/adminPass
 chmod +x /usr/bin/adminPass
 if [[ $VERSION = "OLS" ]] ; then
@@ -1069,7 +1086,7 @@ echo -e "         \e[31m/etc/cyberpanel/mysqlPassword\e[39m with new password as
 echo "                                                                   "
 echo "              Website : https://www.cyberpanel.net                 "
 echo "              Forums  : https://forums.cyberpanel.net              "
-echo "              Wikipage: https://docs.cyberpanel.net                "
+echo "              Wikipage: https://cyberpanel.net/KnowledgeBase/                "
 echo "                                                                   "
 echo -e "            Enjoy your accelerated Internet by                  "
 echo -e "                CyberPanel & $WORD					                     "

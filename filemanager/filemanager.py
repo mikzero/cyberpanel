@@ -716,7 +716,9 @@ class FileManager:
                 if self.data['fileName'].find(pathCheck) == -1 or self.data['fileName'].find('..') > -1:
                     return self.ajaxPre(0, 'Not allowed.')
 
-                command = 'cat ' + self.returnPathEnclosed(self.data['fileName'])
+                # Ensure proper UTF-8 handling for file reading
+                # Use explicit UTF-8 locale for the cat command
+                command = 'LANG=C.UTF-8 LC_ALL=C.UTF-8 cat ' + self.returnPathEnclosed(self.data['fileName'])
                 finalData['fileContents'] = ProcessUtilities.outputExecutioner(command, website.externalApp)
             except:
                 pathCheck = '/'
@@ -724,12 +726,15 @@ class FileManager:
                 if self.data['fileName'].find(pathCheck) == -1 or self.data['fileName'].find('..') > -1:
                     return self.ajaxPre(0, 'Not allowed.')
 
-                command = 'cat ' + self.returnPathEnclosed(self.data['fileName'])
+                # Ensure proper UTF-8 handling for file reading
+                # Use explicit UTF-8 locale for the cat command
+                command = 'LANG=C.UTF-8 LC_ALL=C.UTF-8 cat ' + self.returnPathEnclosed(self.data['fileName'])
                 finalData['fileContents'] = ProcessUtilities.outputExecutioner(command)
 
 
-            json_data = json.dumps(finalData)
-            return HttpResponse(json_data)
+            # Ensure proper UTF-8 encoding in JSON response
+            json_data = json.dumps(finalData, ensure_ascii=False)
+            return HttpResponse(json_data, content_type='application/json; charset=utf-8')
 
         except BaseException as msg:
             return self.ajaxPre(0, str(msg))
@@ -1034,8 +1039,9 @@ class FileManager:
                  'error_message': "Symlink attack."})
             return HttpResponse(final_json)
 
+        # Set home directory ownership
         command = 'chown %s:%s /home/%s' % (website.externalApp, website.externalApp, domainName)
-        ProcessUtilities.popenExecutioner(command)
+        ProcessUtilities.executioner(command)
 
         ### Sym link checks
 
@@ -1048,27 +1054,21 @@ class FileManager:
                  'error_message': "Symlink attack."})
             return HttpResponse(final_json)
 
-        command = 'chown -R -P %s:%s /home/%s/public_html/*' % (externalApp, externalApp, domainName)
-        ProcessUtilities.popenExecutioner(command)
-
-        command = 'chown -R -P %s:%s /home/%s/public_html/.[^.]*' % (externalApp, externalApp, domainName)
-        ProcessUtilities.popenExecutioner(command)
-
-        # command = "chown root:%s /home/" % (groupName) + domainName + "/logs"
-        # ProcessUtilities.popenExecutioner(command)
-
+        # Set file permissions first (before ownership to avoid conflicts)
         command = "find %s -type d -exec chmod 0755 {} \;" % ("/home/" + domainName + "/public_html")
-        ProcessUtilities.popenExecutioner(command)
+        ProcessUtilities.executioner(command)
 
         command = "find %s -type f -exec chmod 0644 {} \;" % ("/home/" + domainName + "/public_html")
-        ProcessUtilities.popenExecutioner(command)
-
-        command = 'chown %s:%s /home/%s/public_html' % (externalApp, groupName, domainName)
         ProcessUtilities.executioner(command)
 
-        command = 'chmod 750 /home/%s/public_html' % (domainName)
+        # Set ownership for all files inside public_html to user:user
+        command = 'chown -R -P %s:%s /home/%s/public_html/*' % (externalApp, externalApp, domainName)
         ProcessUtilities.executioner(command)
 
+        command = 'chown -R -P %s:%s /home/%s/public_html/.[^.]*' % (externalApp, externalApp, domainName)
+        ProcessUtilities.executioner(command)
+
+        # Process child domains first
         for childs in website.childdomains_set.all():
             command = 'ls -la %s' % childs.path
             result = ProcessUtilities.outputExecutioner(command)
@@ -1079,21 +1079,30 @@ class FileManager:
                      'error_message': "Symlink attack."})
                 return HttpResponse(final_json)
 
-
+            # Set file permissions first
             command = "find %s -type d -exec chmod 0755 {} \;" % (childs.path)
-            ProcessUtilities.popenExecutioner(command)
+            ProcessUtilities.executioner(command)
 
             command = "find %s -type f -exec chmod 0644 {} \;" % (childs.path)
-            ProcessUtilities.popenExecutioner(command)
+            ProcessUtilities.executioner(command)
 
+            # Set ownership for all files inside child domain to user:user
             command = 'chown -R -P %s:%s %s/*' % (externalApp, externalApp, childs.path)
-            ProcessUtilities.popenExecutioner(command)
+            ProcessUtilities.executioner(command)
 
             command = 'chown -R -P %s:%s %s/.[^.]*' % (externalApp, externalApp, childs.path)
-            ProcessUtilities.popenExecutioner(command)
+            ProcessUtilities.executioner(command)
 
+            # Set child domain directory itself to 755 with user:nogroup
             command = 'chmod 755 %s' % (childs.path)
-            ProcessUtilities.popenExecutioner(command)
+            ProcessUtilities.executioner(command)
 
             command = 'chown %s:%s %s' % (externalApp, groupName, childs.path)
-            ProcessUtilities.popenExecutioner(command)
+            ProcessUtilities.executioner(command)
+
+        # Set public_html directory itself to user:nogroup with 750 permissions (done at the end)
+        command = 'chown %s:%s /home/%s/public_html' % (externalApp, groupName, domainName)
+        ProcessUtilities.executioner(command)
+
+        command = 'chmod 750 /home/%s/public_html' % (domainName)
+        ProcessUtilities.executioner(command)

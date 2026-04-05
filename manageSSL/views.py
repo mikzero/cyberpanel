@@ -103,14 +103,46 @@ def v2IssueSSL(request):
 
                         website.ssl = 1
                         website.save()
+                        
+                        # Extract detailed logs from output
+                        logs = output.split("1,", 1)[1] if "1," in output else output
 
                         data_ret = {'status': 1, "SSL": 1,
-                                    'error_message': "None", 'sslLogs': output}
+                                    'error_message': "None", 'sslLogs': logs, 'fullOutput': output}
                         json_data = json.dumps(data_ret)
                         return HttpResponse(json_data)
                     else:
+                        # Parse error details from output
+                        error_message = output
+                        detailed_error = "SSL issuance failed"
+                        
+                        # Check for common ACME errors
+                        if "Rate limit" in output or "rate limit" in output:
+                            detailed_error = "Let's Encrypt rate limit exceeded. Please wait before retrying."
+                        elif "DNS problem" in output or "NXDOMAIN" in output:
+                            detailed_error = "DNS validation failed. Please ensure your domain points to this server."
+                        elif "Connection refused" in output or "Connection timeout" in output:
+                            detailed_error = "Could not connect to ACME server. Check your firewall settings."
+                        elif "Unauthorized" in output or "authorization" in output:
+                            detailed_error = "Domain authorization failed. Verify domain ownership and DNS settings."
+                        elif "CAA record" in output:
+                            detailed_error = "CAA record prevents issuance. Check your DNS CAA records."
+                        elif "Challenge failed" in output or "challenge failed" in output:
+                            detailed_error = "ACME challenge failed. Ensure port 80 is accessible and .well-known path is not blocked."
+                        elif "Invalid response" in output:
+                            detailed_error = "Invalid response from ACME challenge. Check your web server configuration."
+                        else:
+                            # Try to extract the actual error message
+                            if "0," in output:
+                                error_parts = output.split("0,", 1)
+                                if len(error_parts) > 1:
+                                    detailed_error = error_parts[1].strip()
+                        
                         data_ret = {'status': 0, "SSL": 0,
-                                    'error_message': output, 'sslLogs': output}
+                                    'error_message': detailed_error, 
+                                    'sslLogs': output,
+                                    'fullOutput': output,
+                                    'technicalDetails': error_message}
                         json_data = json.dumps(data_ret)
                         return HttpResponse(json_data)
         except BaseException as msg:
@@ -331,5 +363,75 @@ def obtainMailServerSSL(request):
     except KeyError as msg:
         data_ret = {"status": 0, "SSL": 0,
                     'error_message': str(msg)}
+        json_data = json.dumps(data_ret)
+        return HttpResponse(json_data)
+
+def getSSLDetails(request):
+    try:
+        userID = request.session['userID']
+        admin = Administrator.objects.get(pk=userID)
+        try:
+            if request.method == 'POST':
+                currentACL = ACLManager.loadedACL(userID)
+
+                if currentACL['admin'] == 1:
+                    pass
+                elif currentACL['manageSSL'] == 1:
+                    pass
+                else:
+                    return ACLManager.loadErrorJson('SSL', 0)
+
+                data = json.loads(request.body)
+                virtualHost = data['virtualHost']
+
+                if ACLManager.checkOwnership(virtualHost, admin, currentACL) == 1:
+                    pass
+                else:
+                    return ACLManager.loadErrorJson()
+
+                try:
+                    website = ChildDomains.objects.get(domain=virtualHost)
+                except:
+                    website = Websites.objects.get(domain=virtualHost)
+
+                try:
+                    import OpenSSL
+                    from datetime import datetime
+                    filePath = '/etc/letsencrypt/live/%s/fullchain.pem' % (virtualHost)
+                    x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM,
+                                                           open(filePath, 'r').read())
+                    expireData = x509.get_notAfter().decode('ascii')
+                    finalDate = datetime.strptime(expireData, '%Y%m%d%H%M%SZ')
+
+                    now = datetime.now()
+                    diff = finalDate - now
+                    
+                    data_ret = {
+                        'status': 1,
+                        'hasSSL': True,
+                        'days': str(diff.days),
+                        'authority': x509.get_issuer().get_components()[1][1].decode('utf-8'),
+                        'expiryDate': finalDate.strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    
+                    if data_ret['authority'] == 'Denial':
+                        data_ret['authority'] = 'SELF-SIGNED SSL'
+                    
+                except BaseException as msg:
+                    data_ret = {
+                        'status': 1,
+                        'hasSSL': False,
+                        'error_message': str(msg)
+                    }
+
+                json_data = json.dumps(data_ret)
+                return HttpResponse(json_data)
+
+        except BaseException as msg:
+            data_ret = {'status': 0, 'error_message': str(msg)}
+            json_data = json.dumps(data_ret)
+            return HttpResponse(json_data)
+    except KeyError:
+        data_ret = {'status': 0, 'error_message': 'Not logged in'}
         json_data = json.dumps(data_ret)
         return HttpResponse(json_data)

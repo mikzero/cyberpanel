@@ -29,4 +29,26 @@ urlpatterns = [
     re_path(r'^cyberPanelVersion$', views.cyberPanelVersion, name='cyberPanelVersion'),
     re_path(r'^runAWSBackups$', views.runAWSBackups, name='runAWSBackups'),
     re_path(r'^submitUserCreation$', views.submitUserCreation, name='submitUserCreation'),
+    
+    # AI Scanner API endpoints for external workers
+    re_path(r'^ai-scanner/authenticate$', views.aiScannerAuthenticate, name='aiScannerAuthenticateAPI'),
+    re_path(r'^ai-scanner/files/list$', views.aiScannerListFiles, name='aiScannerListFilesAPI'),
+    re_path(r'^ai-scanner/files/content$', views.aiScannerGetFileContent, name='aiScannerGetFileContentAPI'),
+    re_path(r'^ai-scanner/callback$', views.aiScannerCallback, name='aiScannerCallbackAPI'),
+    
+    # Real-time monitoring endpoints
+    re_path(r'^ai-scanner/status-webhook$', views.aiScannerStatusWebhook, name='aiScannerStatusWebhookAPI'),
+    re_path(r'^ai-scanner/callback/status-webhook$', views.aiScannerStatusWebhook, name='aiScannerStatusWebhookCallbackAPI'),  # Alternative URL for worker compatibility
+    re_path(r'^ai-scanner/scan/(?P<scan_id>[^/]+)/live-progress$', views.aiScannerLiveProgress, name='aiScannerLiveProgressAPI'),
+
+    # File operation endpoints for AI Scanner
+    re_path(r'^scanner/backup-file$', views.scannerBackupFile, name='scannerBackupFileAPI'),
+    re_path(r'^scanner/get-file$', views.scannerGetFile, name='scannerGetFileAPI'),
+    re_path(r'^scanner/replace-file$', views.scannerReplaceFile, name='scannerReplaceFileAPI'),
+    re_path(r'^scanner/rename-file$', views.scannerRenameFile, name='scannerRenameFileAPI'),
+    re_path(r'^scanner/delete-file$', views.scannerDeleteFile, name='scannerDeleteFileAPI'),
+
+    # Debug endpoints for testing API authentication (remove in production)
+    re_path(r'^ai-scanner/test-auth$', views.testAuthDebug, name='testAuthDebugAPI'),
+    re_path(r'^ai-scanner/list-api-keys$', views.listApiKeysDebug, name='listApiKeysDebugAPI'),
 ]

@@ -20,6 +20,7 @@ class ProcessUtilities(multi.Thread):
     ubuntu20 = 3
     ubuntu22Check = 0
     alma9check = 0
+    ubuntu24Check = 0  # New flag for Ubuntu 24.04 specific handling
     server_address = '/usr/local/lscpd/admin/comm.sock'
     token = "unset"
     portPath = '/usr/local/lscp/conf/bind.conf'
@@ -127,7 +128,7 @@ class ProcessUtilities(multi.Thread):
                     res = subprocess.call(command, shell=shell, stdout=f, stderr=f)
 
             if os.path.exists(ProcessUtilities.debugPath):
-                logging.writeToFile(command)
+                logging.writeToFile(f"{command} [Exit Code: {res}]")
 
             if res == 0:
                 return 1
@@ -169,27 +170,37 @@ class ProcessUtilities(multi.Thread):
         distroPath = '/etc/lsb-release'
         distroPathAlma = '/etc/redhat-release'
 
-        if os.path.exists(distroPath):
-            
-            ## this is check only
-            if open(distroPath, 'r').read().find('22.04') > -1:
-                ProcessUtilities.ubuntu22Check = 1
+        # First check if we're on Ubuntu
+        if os.path.exists('/etc/os-release'):
+            with open('/etc/os-release', 'r') as f:
+                content = f.read()
+                if 'Ubuntu' in content:
+                    if '24.04' in content:
+                        ProcessUtilities.ubuntu22Check = 1
+                        ProcessUtilities.ubuntu24Check = 1  # Specific flag for Ubuntu 24.04
+                        # Ubuntu 24.04 uses newer package versions, set flag for compatibility
+                        ProcessUtilities.alma9check = 1  # Reuse flag to indicate Ubuntu 24.04
+                        return ProcessUtilities.ubuntu20
+                    elif '22.04' in content:
+                        ProcessUtilities.ubuntu22Check = 1
+                        return ProcessUtilities.ubuntu20
+                    elif '20.04' in content:
+                        return ProcessUtilities.ubuntu20
+                    return ProcessUtilities.ubuntu
 
-            if open(distroPath, 'r').read().find('20.04') > -1 or open(distroPath, 'r').read().find('22.04'):
-                return ProcessUtilities.ubuntu20
-            return ProcessUtilities.ubuntu
-        else:
-            if open('/etc/redhat-release', 'r').read().find('CentOS Linux release 8') > -1 or open('/etc/redhat-release', 'r').read().find('AlmaLinux release 8') > -1 \
-                    or open('/etc/redhat-release', 'r').read().find('Rocky Linux release 8') > -1 \
-                    or open('/etc/redhat-release', 'r').read().find('Rocky Linux release 9') > -1 or open('/etc/redhat-release', 'r').read().find('AlmaLinux release 9') > -1 or \
-                    open('/etc/redhat-release', 'r').read().find('CloudLinux release 9') > -1 or open('/etc/redhat-release', 'r').read().find('CloudLinux release 8') > -1:
-                ## this is check only
-                if open(distroPathAlma, 'r').read().find('AlmaLinux release 9') > -1 or open(distroPathAlma, 'r').read().find('Rocky Linux release 9') > -1:
-                    ProcessUtilities.alma9check = 1
+        # Check for RedHat-based distributions
+        if os.path.exists(distroPathAlma):
+            with open(distroPathAlma, 'r') as f:
+                content = f.read()
+                if any(x in content for x in ['CentOS Linux release 8', 'AlmaLinux release 8', 'Rocky Linux release 8', 
+                                            'Rocky Linux release 9', 'AlmaLinux release 9', 'CloudLinux release 9', 
+                                            'CloudLinux release 8', 'AlmaLinux release 10']):
+                    if any(x in content for x in ['AlmaLinux release 9', 'Rocky Linux release 9', 'AlmaLinux release 10']):
+                        ProcessUtilities.alma9check = 1
+                    return ProcessUtilities.cent8
 
-                return ProcessUtilities.cent8
-            return ProcessUtilities.centos
-
+        # Default to Ubuntu if no other distribution is detected
+        return ProcessUtilities.ubuntu
 
     @staticmethod
     def containerCheck():
@@ -222,18 +233,64 @@ class ProcessUtilities(multi.Thread):
                 time.sleep(2)
 
     @staticmethod
-    def sendCommand(command, user=None, dir=None):
+    def sendCommand(command, user=None, dir=None, retries=3):
+        """
+        Send command to lscpd with retry mechanism
+        
+        :param command: Command to execute
+        :param user: User to run command as
+        :param dir: Directory to run command in
+        :param retries: Number of retry attempts if connection fails
+        """
+        attempt = 0
+        last_error = None
+        ret = None
+        
+        while attempt < retries:
+            try:
+                ret = ProcessUtilities.setupUDSConnection()
+
+                if ret[0] == -1:
+                    attempt += 1
+                    last_error = ret[1]
+                    if attempt < retries:
+                        logging.writeToFile(f"[sendCommand] Connection failed, attempt {attempt}/{retries}. Retrying in 2 seconds...")
+                        time.sleep(2)
+                        # Try to restart lscpd if this is the second attempt
+                        if attempt == 2:
+                            logging.writeToFile("[sendCommand] Attempting to restart lscpd service...")
+                            try:
+                                subprocess.run(['systemctl', 'restart', 'lscpd'], capture_output=True, text=True)
+                                time.sleep(3)  # Give lscpd time to start
+                            except Exception as e:
+                                logging.writeToFile(f"[sendCommand] Failed to restart lscpd: {str(e)}")
+                        continue
+                    else:
+                        logging.writeToFile(f"[sendCommand] All connection attempts failed. Last error: {last_error}")
+                        return f"-1Connection failed after {retries} attempts: {last_error}"
+                
+                # If we get here, connection succeeded
+                break
+                
+            except Exception as e:
+                attempt += 1
+                last_error = str(e)
+                if attempt < retries:
+                    logging.writeToFile(f"[sendCommand] Unexpected error, attempt {attempt}/{retries}: {last_error}")
+                    time.sleep(2)
+                    continue
+                else:
+                    return f"-1Error after {retries} attempts: {last_error}"
+        
         try:
-            ret = ProcessUtilities.setupUDSConnection()
-
-            if ret[0] == -1:
-                return ret[0]
-
+            # At this point, we have a successful connection
+            if ret is None:
+                return "-1Internal error: connection result is None"
+            sock = ret[0]
+            
             if ProcessUtilities.token == "unset":
                 ProcessUtilities.token = os.environ.get('TOKEN')
                 del os.environ['TOKEN']
-
-            sock = ret[0]
 
             if user == None:
                 if command.find('export') > -1:
@@ -242,8 +299,8 @@ class ProcessUtilities(multi.Thread):
                     command = 'sudo %s' % (command)
 
                 if os.path.exists(ProcessUtilities.debugPath):
-                    if command.find('cat') == -1:
-                        logging.writeToFile(ProcessUtilities.token + command)
+                    # Log all commands for debugging
+                    logging.writeToFile(command)
 
                 if dir == None:
                     sock.sendall((ProcessUtilities.token + command).encode('utf-8'))
@@ -262,23 +319,49 @@ class ProcessUtilities(multi.Thread):
 
 
                 if os.path.exists(ProcessUtilities.debugPath):
-                    if command.find('cat') == -1:
-                        logging.writeToFile(command)
+                    # Log all commands for debugging
+                    logging.writeToFile(command)
 
                 sock.sendall(command.encode('utf-8'))
 
-            data = ""
+            # Collect all raw bytes first, then decode as a complete unit
+            raw_data = b""
 
             while (1):
                 currentData = sock.recv(32)
                 if len(currentData) == 0 or currentData == None:
                     break
-                try:
-                    data = data + currentData.decode(errors = 'ignore')
-                except BaseException as msg:
-                    logging.writeToFile('Some data could not be decoded to str, error message: %s' % str(msg))
+                raw_data += currentData
+
+            # Decode all data at once to prevent UTF-8 character boundary issues
+            try:
+                data = raw_data.decode('utf-8', errors='replace')
+            except BaseException as msg:
+                logging.writeToFile('Some data could not be decoded to str, error message: %s' % str(msg))
+                data = ""
 
             sock.close()
+            
+            # Log exit code if debug is enabled
+            if os.path.exists(ProcessUtilities.debugPath):
+                if len(data) == 0:
+                    logging.writeToFile(f"    └─ Empty response from lscpd")
+                else:
+                    try:
+                        exit_char = data[-1]
+                        # Log raw data for debugging
+                        logging.writeToFile(f"    └─ Response length: {len(data)}, last char: {repr(exit_char)}")
+                        
+                        if isinstance(exit_char, str):
+                            exit_code = ord(exit_char)
+                        else:
+                            exit_code = "unknown"
+                        # Log the actual command that was executed (without token)
+                        clean_command = command.replace(ProcessUtilities.token, '').replace('-u %s ' % user if user else '', '').replace('-d %s ' % dir if dir else '', '').strip()
+                        logging.writeToFile(f"    └─ {clean_command} [Exit Code: {exit_code}]")
+                    except Exception as e:
+                        logging.writeToFile(f"    └─ Failed to log exit code: {str(e)}")
+            
             #logging.writeToFile('Final data: %s.' % (str(data)))
 
             return data
@@ -289,18 +372,46 @@ class ProcessUtilities(multi.Thread):
     @staticmethod
     def executioner(command, user=None, shell=False):
         try:
+            if os.path.exists(ProcessUtilities.debugPath):
+                logging.writeToFile(f"[executioner] Called with command: {command}, user: {user}, shell: {shell}")
+            
             if getpass.getuser() == 'root':
+                if os.path.exists(ProcessUtilities.debugPath):
+                    logging.writeToFile(f"[executioner] Running as root, using normalExecutioner")
                 ProcessUtilities.normalExecutioner(command, shell, user)
                 return 1
 
+            if os.path.exists(ProcessUtilities.debugPath):
+                logging.writeToFile(f"[executioner] Not root, using sendCommand via lscpd")
+            
             ret = ProcessUtilities.sendCommand(command, user)
 
-            exitCode = ret[len(ret) -1]
-            exitCode = int(codecs.encode(exitCode.encode(), 'hex'))
-
-            if exitCode == 0:
-                return 1
-            else:
+            # Check if we got any response
+            if not ret or len(ret) == 0:
+                logging.writeToFile("Empty response from lscpd for command: %s" % command)
+                return 0
+            
+            # Extract exit code from last character
+            try:
+                exitCode = ret[-1]
+                # Convert the last character to its ASCII value
+                if isinstance(exitCode, str):
+                    exitCode = ord(exitCode)
+                elif isinstance(exitCode, bytes):
+                    exitCode = exitCode[0] if len(exitCode) > 0 else 1
+                else:
+                    # Try the original hex encoding method as fallback
+                    exitCode = int(codecs.encode(exitCode.encode(), 'hex'))
+                
+                if os.path.exists(ProcessUtilities.debugPath):
+                    logging.writeToFile(f'Exit code from lscpd: {exitCode} for command: {command}')
+                
+                if exitCode == 0:
+                    return 1
+                else:
+                    return 0
+            except Exception as e:
+                logging.writeToFile(f"Failed to parse exit code: {str(e)} for command: {command}")
                 return 0
 
         except BaseException as msg:
@@ -310,9 +421,6 @@ class ProcessUtilities(multi.Thread):
     @staticmethod
     def outputExecutioner(command, user=None, shell = None, dir = None, retRequired = None):
         try:
-            if os.path.exists('/usr/local/CyberCP/debug'):
-                logging.writeToFile(command)
-
             if getpass.getuser() == 'root':
                 if os.path.exists(ProcessUtilities.debugPath):
                     logging.writeToFile(command)
@@ -320,15 +428,32 @@ class ProcessUtilities(multi.Thread):
                 if user!=None:
                     if not command.startswith('sudo'):
                         command = f'sudo -u {user} {command}'
+                # Ensure UTF-8 environment for proper character handling
+                env = os.environ.copy()
+                env['LC_ALL'] = 'C.UTF-8'
+                env['LANG'] = 'C.UTF-8'
+                env['PYTHONIOENCODING'] = 'utf-8'
+                
                 if shell == None or shell == True:
-                    p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, encoding='utf-8', errors='replace')
                 else:
-                    p = subprocess.Popen(shlex.split(command),  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    p = subprocess.Popen(shlex.split(command),  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, encoding='utf-8', errors='replace')
 
                 if retRequired:
-                    return 1, p.communicate()[0].decode("utf-8")
+                    output, _ = p.communicate()
+                    exit_code = p.returncode
+                    if os.path.exists(ProcessUtilities.debugPath):
+                        logging.writeToFile(f"    └─ [Exit Code: {exit_code}]")
+                    if exit_code == 0:
+                        return 1, output
+                    else:
+                        return 0, output
                 else:
-                    return p.communicate()[0].decode("utf-8")
+                    output = p.communicate()[0]
+                    exit_code = p.returncode
+                    if os.path.exists(ProcessUtilities.debugPath):
+                        logging.writeToFile(f"    └─ [Exit Code: {exit_code}]")
+                    return output
 
             if type(command) == list:
                 command = " ".join(command)
@@ -336,17 +461,37 @@ class ProcessUtilities(multi.Thread):
             if retRequired:
                 ret = ProcessUtilities.sendCommand(command, user)
 
-                exitCode = ret[len(ret) - 1]
-
-                if os.path.exists(ProcessUtilities.debugPath):
-                    logging.writeToFile(f'Status of command in outputExecutioner is {str(exitCode)}')
-
-                exitCode = int(codecs.encode(exitCode.encode(), 'hex'))
-
-                if exitCode == 0:
-                    return 1, ret[:-1]
-                else:
-                    return 0, ret[:-1]
+                # Check if we got any response
+                if not ret or len(ret) == 0:
+                    logging.writeToFile("Empty response from lscpd in outputExecutioner for command: %s" % command)
+                    return 0, ""
+                
+                # Extract exit code from last character
+                try:
+                    exitCode = ret[-1]
+                    
+                    if os.path.exists(ProcessUtilities.debugPath):
+                        logging.writeToFile(f'Raw exit code character in outputExecutioner: {repr(exitCode)}')
+                    
+                    # Convert the last character to its ASCII value
+                    if isinstance(exitCode, str):
+                        exitCode = ord(exitCode)
+                    elif isinstance(exitCode, bytes):
+                        exitCode = exitCode[0] if len(exitCode) > 0 else 1
+                    else:
+                        # Try the original hex encoding method as fallback
+                        exitCode = int(codecs.encode(exitCode.encode(), 'hex'))
+                    
+                    if os.path.exists(ProcessUtilities.debugPath):
+                        logging.writeToFile(f'Parsed exit code in outputExecutioner: {exitCode} for command: {command}')
+                    
+                    if exitCode == 0:
+                        return 1, ret[:-1]
+                    else:
+                        return 0, ret[:-1]
+                except Exception as e:
+                    logging.writeToFile(f"Failed to parse exit code in outputExecutioner: {str(e)} for command: {command}")
+                    return 0, ret[:-1] if len(ret) > 1 else ""
             else:
                 return ProcessUtilities.sendCommand(command, user, dir)[:-1]
         except BaseException as msg:
@@ -409,6 +554,21 @@ class ProcessUtilities(multi.Thread):
         return None
 
     @staticmethod
+    def getNumberOfCores():
+        """Get the number of CPU cores available on the system"""
+        try:
+            import multiprocessing
+            return multiprocessing.cpu_count()
+        except:
+            try:
+                # Fallback method using /proc/cpuinfo
+                with open('/proc/cpuinfo', 'r') as f:
+                    return len([line for line in f if line.startswith('processor')])
+            except:
+                # Default to 2 if we can't determine
+                return 2
+
+    @staticmethod
     def fetch_latest_prestashop_version():
         import requests
         url = "https://api.github.com/repos/PrestaShop/PrestaShop/releases"
@@ -424,6 +584,4 @@ class ProcessUtilities(multi.Thread):
             print("An error occurred:", e)
             logging.writeToFile(f"[fetch_latest_prestashop_version] An error occurred: {str(e)}")
         return None
-
-
-
+    

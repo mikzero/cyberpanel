@@ -10,22 +10,72 @@ app.controller('createDatabase', function ($scope, $http) {
         $(".dbDetails").hide();
         $(".generatedPasswordDetails").hide();
         $('#create-database-select').select2();
+        
+        // Initialize preview if website is already selected
+        setTimeout(function() {
+            if ($scope.databaseWebsite) {
+                var truncatedName = $scope.getTruncatedWebName($scope.databaseWebsite);
+                $("#domainDatabase").text(truncatedName);
+                $("#domainUsername").text(truncatedName);
+                $(".dbDetails").show();
+            }
+        }, 100);
     });
+
+    // Helper function to get truncated website name
+    $scope.getTruncatedWebName = function(domain) {
+        if (!domain) return '';
+        
+        // Remove hyphens and get first part before dot
+        var webName = domain.replace(/-/g, '').split('.')[0];
+        
+        // Truncate to 4 characters if longer than 5
+        if (webName.length > 5) {
+            webName = webName.substring(0, 4);
+        }
+        
+        return webName;
+    };
 
     $('#create-database-select').on('select2:select', function (e) {
         var data = e.params.data;
         $scope.databaseWebsite = data.text;
         $(".dbDetails").show();
-        $("#domainDatabase").text(getWebsiteName(data.text));
-        $("#domainUsername").text(getWebsiteName(data.text));
+        
+        // Use local truncation function to ensure consistency
+        var truncatedName = $scope.getTruncatedWebName(data.text);
+        $("#domainDatabase").text(truncatedName);
+        $("#domainUsername").text(truncatedName);
+        
+        // Apply scope to update Angular bindings
+        $scope.$apply();
     });
 
 
     $scope.showDetailsBoxes = function () {
         $scope.dbDetails = false;
     }
+    
+    // Function called when website selection changes
+    $scope.websiteChanged = function() {
+        if ($scope.databaseWebsite) {
+            $(".dbDetails").show();
+            var truncatedName = $scope.getTruncatedWebName($scope.databaseWebsite);
+            $("#domainDatabase").text(truncatedName);
+            $("#domainUsername").text(truncatedName);
+        }
+    }
 
     $scope.createDatabaseLoading = true;
+    
+    // Watch for changes to databaseWebsite to update preview
+    $scope.$watch('databaseWebsite', function(newValue, oldValue) {
+        if (newValue && newValue !== oldValue) {
+            var truncatedName = $scope.getTruncatedWebName(newValue);
+            $("#domainDatabase").text(truncatedName);
+            $("#domainUsername").text(truncatedName);
+        }
+    });
 
     $scope.createDatabase = function () {
 
@@ -39,14 +89,8 @@ app.controller('createDatabase', function ($scope, $http) {
         var dbPassword = $scope.dbPassword;
         var webUserName = "";
 
-        // getting website username
-
-        webUserName = databaseWebsite.replace(/-/g, '');
-        webUserName = webUserName.split(".")[0];
-
-        if (webUserName.length > 5) {
-            webUserName = webUserName.substring(0, 4);
-        }
+        // getting website username - use the same truncation function for consistency
+        webUserName = $scope.getTruncatedWebName(databaseWebsite);
 
         var url = "/dataBases/submitDBCreation";
 
@@ -75,9 +119,15 @@ app.controller('createDatabase', function ($scope, $http) {
 
                 $scope.createDatabaseLoading = true;
                 $scope.dbDetails = false;
+                var successMessage = 'Database successfully created.';
+                if (response.data.dbName && response.data.dbUsername) {
+                    successMessage = 'Database successfully created.\n' +
+                                   'Database Name: ' + response.data.dbName + '\n' +
+                                   'Database User: ' + response.data.dbUsername;
+                }
                 new PNotify({
                     title: 'Success!',
-                    text: 'Database successfully created.',
+                    text: successMessage,
                     type: 'success'
                 });
             } else {
@@ -632,13 +682,13 @@ app.controller('phpMyAdmin', function ($scope, $http, $window) {
 
 
 app.controller('Mysqlmanager', function ($scope, $http, $compile, $window, $timeout) {
-    $scope.cyberPanelLoading = true;
+    $scope.cyberPanelLoading = false;
     $scope.mysql_status = 'test'
 
 
     $scope.getstatus = function () {
 
-        $scope.cyberPanelLoading = false;
+        $scope.cyberPanelLoading = true;
 
         url = "/dataBases/getMysqlstatus";
 
@@ -655,7 +705,7 @@ app.controller('Mysqlmanager', function ($scope, $http, $compile, $window, $time
 
 
         function ListInitialDatas(response) {
-            $scope.cyberPanelLoading = true;
+            $scope.cyberPanelLoading = false;
             if (response.data.status === 1) {
                 $scope.uptime = response.data.uptime;
                 $scope.connections = response.data.connections;
@@ -679,7 +729,7 @@ app.controller('Mysqlmanager', function ($scope, $http, $compile, $window, $time
         }
 
         function cantLoadInitialDatas(response) {
-            $scope.cyberPanelLoading = true;
+            $scope.cyberPanelLoading = false;
             new PNotify({
                 title: 'Error!',
                 text: "cannot load",
